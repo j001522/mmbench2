@@ -148,9 +148,13 @@ def sample_one_timestep_packed(
     z_prev: Optional[torch.Tensor] = None,     # (B,n_spatial,d_spatial) previous latent for warm start
     tau_init: float = 0.0,                      # warm-start noise level (0 = pure noise)
     use_kv_cache: bool = False,                 # enable KV caching for context tokens
+    per_sample_instability: bool = False,       # return (B,) instability instead of a pooled float
 ) -> Union[Tuple[torch.Tensor, float], Tuple[torch.Tensor, torch.Tensor, float]]:
     """
     Generate next packed latent z_{t}: (B,n_spatial,d_spatial) given past length t.
+
+    per_sample_instability=True returns the instability as a (B,) float32 tensor
+    (RMS over each sample's latent only) instead of one float pooled over the batch.
     Always returns a trailing `instability` scalar (float): the mean RMS change in
     x1_hat across the tail half of executed Euler steps. Low = confident denoising
     (x1_hat stabilizes); high = the model keeps revising its prediction and is
@@ -278,7 +282,9 @@ def sample_one_timestep_packed(
 
         x1_hat_f = x1_hat.float()
         if x1_hat_prev is not None:
-            step_deltas.append((x1_hat_f - x1_hat_prev).pow(2).mean().sqrt())
+            sq = (x1_hat_f - x1_hat_prev).pow(2)
+            step_deltas.append(sq.flatten(1).mean(1).sqrt() if per_sample_instability
+                               else sq.mean().sqrt())
         x1_hat_prev = x1_hat_f
 
         denom = max(1e-4, 1.0 - tau_i)
@@ -291,9 +297,11 @@ def sample_one_timestep_packed(
     if step_deltas:
         all_deltas = torch.stack(step_deltas)
         tail = all_deltas[len(all_deltas) // 2 :] if len(all_deltas) > 1 else all_deltas
-        instability = float(tail.mean().item())
+        instability = (tail.mean(0) if per_sample_instability
+                       else float(tail.mean().item()))
     else:
-        instability = 0.0
+        instability = (torch.zeros(B, device=device) if per_sample_instability
+                       else 0.0)
 
     z_next = z[:, 0]  # (B,n_spatial,d_spatial)
 

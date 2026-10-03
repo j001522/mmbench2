@@ -559,6 +559,9 @@ def train(args):
     # ---- train ----
     model.train()
     t0 = time.time()
+    # Rolling step-rate window, reset at every print (t0 alone would average in
+    # startup and any validation pass).
+    t_win, step_win = t0, step
     grad_accum = max(1, int(args.grad_accum))
 
     # Per-domain MSE accumulator (flushed at each log_every boundary).
@@ -699,10 +702,15 @@ def train(args):
 
                 if is_rank0() and (step % args.print_every == 0):
                     psnr = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-10))
+                    now = time.time()
+                    s_per_step = (now - t_win) / max(1, step - step_win)
+                    t_win, step_win = now, step
                     print(
                         f"step {step:07d} | loss={loss.item():.6f} "
                         f"| mse={mse.item():.6f} | lpips={lp.item():.4f} "
-                        f"| psnr={psnr.item():.2f} | keep={keep_prob.mean().item():.3f} | gnorm={grad_norm:.3f}"
+                        f"| psnr={psnr.item():.2f} | keep={keep_prob.mean().item():.3f} | gnorm={grad_norm:.3f} "
+                        f"| {s_per_step:.3f}s/step | {(now - t0) / 3600.0:.2f}h",
+                        flush=True,
                     )
 
                 # ---- viz ----
