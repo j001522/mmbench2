@@ -141,14 +141,36 @@ def imagine_batch(
     lang_emb: Optional[torch.Tensor], use_amp: bool,
     return_h: bool = False,
     use_kv_cache: bool = True,
+    past_actions: Optional[torch.Tensor] = None,
+    max_ctx: int = 0,
+    tau_ctx: float = 0.0,
 ):
     """
     Inputs:
-      z_start:     (B, n_spatial, d_spatial)
+      z_start:     (B, n_spatial, d_spatial) for a single-frame start, or
+                   (B, t, n_spatial, d_spatial) to seed the rollout with t
+                   context frames (e.g. the last t real observations in
+                   closed-loop MPC). A single frame carries no velocity
+                   information, so multi-frame context matters for control.
+      past_actions: (B, t, 16), only meaningful with a multi-frame z_start:
+                   the actions actually executed, aligned to the context
+                   frames under the led-to convention (past_actions[:,i] is
+                   the action that produced z_start[:,i], so entry 0 is the
+                   zero action). Defaults to zeros.
       action_plan: (B, H, 16); action_plan[:,t] produces z_{t+1}.
+      max_ctx:     0 (default) keeps every frame in context, as the model
+                   attends over the whole rollout. >0 slides a window of that
+                   many most-recent frames, which keeps the context within
+                   the length the model was trained on (--seq_len, 24 by
+                   default) on long horizons.
+      tau_ctx:     context corruption fraction per step (interactive.
+                   sample_one_timestep_packed). 0 = clean context; the
+                   annotated rollouts use 0.1, which hallucinates 8-25 pts
+                   less than 0 (ctx_ablation.py, 2026-10-03).
     Returns:
       return_h=False (default): z_seq: (B, 1+H, n_spatial, d_spatial) with
-        z_seq[:,0] = z_start.
+        z_seq[:,0] = the last context frame (= z_start when it is a single
+        frame), so the returned shape does not depend on the context length.
       return_h=True: (z_seq, h_seq) where h_seq is (B, H, n_agent, D) or
         (B, H, D). h_seq[:,t] is h at rollout position t+1 (the one that
         produced z_{t+1}), which aligns with the reward head's MTP l=0
@@ -168,45 +190,99 @@ def imagine_batch(
     B = z_start.shape[0]
     device = z_start.device
 
-    # Prepend the zero action at position 0 (backward convention: action[k] produced z[k]).
-    zero_a = torch.zeros((B, 1, 16), device=device, dtype=action_plan.dtype)
-    full_actions = torch.cat([zero_a, action_plan], dim=1)
-    full_mask = act_mask_1d.view(1, 1, -1).expand(B, 1 + horizon, -1).contiguous()
+    if z_start.dim() == 3:
+        past = z_start.unsqueeze(1).contiguous()
+    elif z_start.dim() == 4:
+        past = z_start.contiguous()
+    else:
+        raise ValueError(f"z_start must be 3D or 4D, got shape {tuple(z_start.shape)}")
+    t_ctx = past.shape[1]
 
-    past = z_start.unsqueeze(1).contiguous()
-    z_outs = [z_start]
+    # Actions aligned to context frames (backward convention: action[k] produced z[k]),
+    # so position 0 is the zero action and the plan continues from position t_ctx.
+    if past_actions is None:
+        ctx_actions = torch.zeros((B, t_ctx, 16), device=device, dtype=action_plan.dtype)
+    else:
+        if tuple(past_actions.shape) != (B, t_ctx, 16):
+            raise ValueError(
+                f"past_actions shape {tuple(past_actions.shape)} != (B={B}, t={t_ctx}, 16)"
+            )
+        ctx_actions = past_actions.to(device=device, dtype=action_plan.dtype)
+    full_actions = torch.cat([ctx_actions, action_plan], dim=1)
+    full_mask = act_mask_1d.view(1, 1, -1).expand(B, t_ctx + horizon, -1).contiguous()
+
+    z_outs = [past[:, -1]]
     h_outs: List[torch.Tensor] = []
     for t in range(horizon):
+        n_ctx = past.shape[1]
+        # Slice latents and actions with the same window so action[i] keeps
+        # pointing at the frame it produced.
+        start = max(0, n_ctx - max_ctx) if max_ctx > 0 else 0
+        z_win = past[:, start:]
+        a_win = full_actions[:, start: n_ctx + 1]
+        m_win = full_mask[:, start: n_ctx + 1]
         out = sample_one_timestep_packed(
             dyn,
-            past_packed=past,
+            past_packed=z_win,
             k_max=k_max,
             sched=sched,
-            actions=full_actions[:, : past.shape[1] + 1],
-            act_mask=full_mask[:, : past.shape[1] + 1],
+            actions=a_win,
+            act_mask=m_win,
             use_amp=use_amp,
             return_h=return_h,
-            tau_ctx=0.0,
+            tau_ctx=tau_ctx,
             lang_emb=lang_emb.expand(B, -1) if lang_emb is not None else None,
             use_kv_cache=use_kv_cache,
         )
         if return_h:
-            z_next, h_new, _inst = out
+            z_next, h_new, _ = out
             h_outs.append(h_new[:, 0])  # (B, n_agent, D) or (B, D)
         else:
-            z_next, _inst = out
+            z_next, _ = out
         z_outs.append(z_next)
         past = torch.cat([past, z_next.unsqueeze(1)], dim=1)
 
     z_seq = torch.stack(z_outs, dim=1).to(torch.float32)
+    h_seq = torch.stack(h_outs, dim=1) if return_h else None
     if not return_h:
         return z_seq
-    h_seq = torch.stack(h_outs, dim=1)
     return z_seq, h_seq
 
 
 LATENT_COST_KINDS = ("terminal",)
 REWARD_COST_KINDS = ("reward",)
+# Predicted return plus a terminal latent-distance term standing in for the
+# value of the final imagined state (there is no value head). The distance is
+# normalized by the start-to-goal distance, so `goal_weight` reads as "cost of
+# staying one full start-to-goal distance away, in units of predicted return"
+# and transfers across tasks and episodes.
+COMBINED_COST_KINDS = ("reward_terminal",)
+# Predicted return plus a *learned* terminal value V(h_H) -- the thing the
+# latent-distance term above stands in for. Needs a value head from
+# train_heads_offline.py (--value_ckpt) and needs no goal latent.
+VALUE_COST_KINDS = ("reward_value",)
+ALL_COST_KINDS = (LATENT_COST_KINDS + REWARD_COST_KINDS
+                  + COMBINED_COST_KINDS + VALUE_COST_KINDS)
+
+
+def needs_reward_head(cost_kind: str) -> bool:
+    return str(cost_kind) in REWARD_COST_KINDS + COMBINED_COST_KINDS + VALUE_COST_KINDS
+
+
+def needs_goal(cost_kind: str) -> bool:
+    return str(cost_kind) in LATENT_COST_KINDS + COMBINED_COST_KINDS
+
+
+def needs_value_head(cost_kind: str) -> bool:
+    return str(cost_kind) in VALUE_COST_KINDS
+
+
+def goal_scale(z_start: torch.Tensor, z_goal: torch.Tensor) -> float:
+    """Start-to-goal latent distance, used to normalize the terminal term of
+    the combined cost. z_start may carry a context dimension; its last frame
+    is the state the plan starts from."""
+    z0 = z_start[-1] if z_start.dim() == 3 else z_start
+    return float((z0.float() - z_goal.float()).flatten().norm().clamp_min(1e-6).item())
 
 
 def latent_cost(
@@ -219,6 +295,19 @@ def latent_cost(
     if kind == "terminal":
         return per_step_l2[:, -1]
     raise ValueError(f"unknown latent cost kind {kind}")
+
+
+@torch.inference_mode()
+def predict_rewards(rew_head, h_seq: torch.Tensor, *, use_amp: bool) -> torch.Tensor:
+    """Predicted reward per rollout step, (B, H), from the reward head's MTP
+    l=0 position (the reward of applying action_plan[t])."""
+    device = h_seq.device
+    with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
+        logits_btlk, centers_log = rew_head(h_seq)          # (B, H, L, K), (K,)
+    logits_l0 = logits_btlk[..., 0, :].float()              # (B, H, K); head l=0 -> r at that step
+    probs = logits_l0.softmax(dim=-1)
+    expected_symlog = (probs * centers_log.float().view(1, 1, -1)).sum(dim=-1)  # (B, H)
+    return symexp(expected_symlog)
 
 
 @torch.inference_mode()
@@ -237,13 +326,7 @@ def reward_cost(
 
     h_seq: (B, H, n_agent, D) or (B, H, D), one hidden state per rollout step.
     """
-    device = h_seq.device
-    with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
-        logits_btlk, centers_log = rew_head(h_seq)          # (B, H, L, K), (K,)
-    logits_l0 = logits_btlk[..., 0, :].float()              # (B, H, K); head l=0 -> r at that step
-    probs = logits_l0.softmax(dim=-1)
-    expected_symlog = (probs * centers_log.float().view(1, 1, -1)).sum(dim=-1)  # (B, H)
-    r_hat = symexp(expected_symlog)                         # (B, H), predicted reward per step
+    r_hat = predict_rewards(rew_head, h_seq, use_amp=use_amp)  # (B, H) per-step reward
     if float(discount) < 1.0:
         H = r_hat.shape[-1]
         gammas = torch.pow(
@@ -252,6 +335,40 @@ def reward_cost(
         )                                                   # (H,)
         return -(r_hat * gammas.view(1, H)).sum(dim=-1)     # (B,)
     return -r_hat.sum(dim=-1)                               # (B,)
+
+
+def combined_cost(
+    rew_head, *, h_seq: torch.Tensor, z_seq: torch.Tensor, z_goal: torch.Tensor,
+    use_amp: bool, discount: float, goal_weight: float, scale: float,
+) -> torch.Tensor:
+    """-sum_t γ^t r_hat_t + goal_weight * ||z_H - z_goal|| / scale."""
+    cost = reward_cost(rew_head, h_seq, use_amp=use_amp, discount=discount)
+    if float(goal_weight) != 0.0:
+        term = latent_cost(z_seq, z_goal, kind="terminal") / float(scale)
+        cost = cost + float(goal_weight) * term
+    return cost
+
+
+def value_cost(
+    rew_head, value_head, *, h_seq: torch.Tensor, use_amp: bool, discount: float,
+) -> torch.Tensor:
+    """-sum_{t<H} gamma^t r_hat_t  -  gamma^H * V(h_{H-1}).
+
+    The learned-value replacement for `combined_cost`'s latent-distance term.
+
+    Discount bookkeeping: `h_seq[:, t]` is h at rollout position t+1, i.e. the
+    state reached by applying action_plan[t], and the reward head's l=0 slot
+    there predicts r_t. So r_hat_{H-1} carries gamma^(H-1) and the first reward
+    the value head accounts for is the next one -- gamma^H. `discount` must be
+    the same gamma the value head was fitted with, or the two terms are on
+    different scales.
+    """
+    cost = reward_cost(rew_head, h_seq, use_amp=use_amp, discount=discount)
+    H = h_seq.shape[1]
+    device = h_seq.device
+    with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
+        v = value_head.predict(h_seq)                  # (B, H)
+    return cost - (float(discount) ** H) * v[:, -1].float()
 
 
 # -------------------- CEM -------------------- #
@@ -296,13 +413,20 @@ def cem_plan(
     init_mu: Optional[torch.Tensor] = None,
     n_rollouts_elite: int = 1,
     rew_head=None,
+    value_head=None,
     discount: float = 1.0,
+    goal_weight: float = 0.0,
+    past_actions: Optional[torch.Tensor] = None,
+    max_ctx: int = 0,
+    tau_ctx: float = 0.0,
 ) -> dict:
     """Diagonal-Gaussian CEM over (horizon, act_dim) plans, clipped to [-1,1].
     `noise_beta` controls the time-axis noise color (0 = white, 2 = Brownian).
     `init_mu` optionally seeds the mean (e.g. from a BC warm-start rollout).
     `n_rollouts_elite` scores each sample by averaging over k denoising
-    rollouts before elite selection (guards against single-rollout overfit)."""
+    rollouts before elite selection (guards against single-rollout overfit).
+    `z_start` may carry a leading context dimension (see `imagine_batch`);
+    `past_actions` and `max_ctx` are forwarded there unchanged."""
     if init_mu is not None:
         assert init_mu.shape == (horizon, act_dim), \
             f"init_mu shape {tuple(init_mu.shape)} != (horizon={horizon}, act_dim={act_dim})"
@@ -316,6 +440,8 @@ def cem_plan(
     history = []
 
     z_start_b = z_start.unsqueeze(0)
+    past_actions_b = None if past_actions is None else past_actions.unsqueeze(0)
+    scale = goal_scale(z_start, z_goal) if needs_goal(cost_kind) else 1.0
 
     k_sel = max(1, int(n_rollouts_elite))
 
@@ -336,27 +462,46 @@ def cem_plan(
         total = n_samples * k_sel
         full_rep = full.unsqueeze(1).expand(-1, k_sel, -1, -1).reshape(total, horizon, 16).contiguous()
 
+        use_combined_cost = cost_kind in COMBINED_COST_KINDS
         use_reward_cost = cost_kind in REWARD_COST_KINDS
-        if use_reward_cost and rew_head is None:
+        use_value_cost = cost_kind in VALUE_COST_KINDS
+        if needs_reward_head(cost_kind) and rew_head is None:
             raise ValueError(f"cost_kind={cost_kind!r} requires a reward head; got rew_head=None")
+        if needs_value_head(cost_kind) and value_head is None:
+            raise ValueError(f"cost_kind={cost_kind!r} requires a value head; got value_head=None")
 
         costs_flat = torch.empty(total, device=device, dtype=torch.float32)
         for s in range(0, total, rollout_batch):
             e = min(s + rollout_batch, total)
-            z0_b = z_start_b.expand(e - s, -1, -1).contiguous()
-            if use_reward_cost:
-                _z_seq, h_seq = imagine_batch(
+            z0_b = z_start_b.expand(e - s, *([-1] * (z_start.dim()))).contiguous()
+            pa_b = (None if past_actions_b is None
+                    else past_actions_b.expand(e - s, -1, -1).contiguous())
+            if use_reward_cost or use_combined_cost or use_value_cost:
+                z_seq, h_seq = imagine_batch(
                     dyn, z_start=z0_b, action_plan=full_rep[s:e], horizon=horizon,
                     sched=sched, k_max=k_max, act_mask_1d=act_mask_1d,
                     lang_emb=lang_emb, use_amp=use_amp,
-                    return_h=True,
+                    return_h=True, past_actions=pa_b, max_ctx=max_ctx, tau_ctx=tau_ctx,
                 )
-                costs_flat[s:e] = reward_cost(rew_head, h_seq, use_amp=use_amp, discount=discount)
+                if use_combined_cost:
+                    costs_flat[s:e] = combined_cost(
+                        rew_head, h_seq=h_seq, z_seq=z_seq, z_goal=z_goal,
+                        use_amp=use_amp, discount=discount,
+                        goal_weight=goal_weight, scale=scale,
+                    )
+                elif use_value_cost:
+                    costs_flat[s:e] = value_cost(
+                        rew_head, value_head, h_seq=h_seq,
+                        use_amp=use_amp, discount=discount,
+                    )
+                else:
+                    costs_flat[s:e] = reward_cost(rew_head, h_seq, use_amp=use_amp, discount=discount)
             else:
                 z_seq = imagine_batch(
                     dyn, z_start=z0_b, action_plan=full_rep[s:e], horizon=horizon,
                     sched=sched, k_max=k_max, act_mask_1d=act_mask_1d,
                     lang_emb=lang_emb, use_amp=use_amp,
+                    past_actions=pa_b, max_ctx=max_ctx, tau_ctx=tau_ctx,
                 )
                 costs_flat[s:e] = latent_cost(z_seq, z_goal, kind=cost_kind)
 
@@ -382,7 +527,8 @@ def cem_plan(
         })
         mu, std = new_mu, new_std
 
-    return {"best_plan": best_plan, "best_cost": float(best_cost), "history": history}
+    return {"best_plan": best_plan, "best_cost": float(best_cost), "history": history,
+            "mu": mu, "std": std}
 
 
 # -------------------- reference-plan scoring (with returned latents) -------------------- #
@@ -396,31 +542,53 @@ def score_plan(
     cost_kind: str, use_amp: bool, device: torch.device,
     n_rollouts: int = 1, return_first_latents: bool = False,
     rew_head=None,
+    value_head=None,
     discount: float = 1.0,
+    goal_weight: float = 0.0,
+    past_actions: Optional[torch.Tensor] = None,
+    max_ctx: int = 0,
 ) -> Tuple[float, Optional[torch.Tensor]]:
     """Averages cost over n_rollouts stochastic denoising seeds. If
     return_first_latents, also returns the first rollout's (1+H, ...) latents
     for visualization."""
+    use_combined_cost = cost_kind in COMBINED_COST_KINDS
     use_reward_cost = cost_kind in REWARD_COST_KINDS
-    if use_reward_cost and rew_head is None:
+    use_value_cost = cost_kind in VALUE_COST_KINDS
+    if needs_reward_head(cost_kind) and rew_head is None:
         raise ValueError(f"cost_kind={cost_kind!r} requires a reward head; got rew_head=None")
+    if needs_value_head(cost_kind) and value_head is None:
+        raise ValueError(f"cost_kind={cost_kind!r} requires a value head; got value_head=None")
 
     full = torch.zeros((n_rollouts, horizon, 16), device=device, dtype=torch.float32)
     full[:, :, :act_dim] = action_plan.unsqueeze(0).expand(n_rollouts, -1, -1)
     full = full * act_mask_1d.view(1, 1, 16)
 
-    z_start_b = z_start.unsqueeze(0).expand(n_rollouts, -1, -1).contiguous()
-    if use_reward_cost:
+    z_start_b = z_start.unsqueeze(0).expand(n_rollouts, *([-1] * z_start.dim())).contiguous()
+    past_actions_b = (None if past_actions is None
+                      else past_actions.unsqueeze(0).expand(n_rollouts, -1, -1).contiguous())
+    if use_reward_cost or use_combined_cost or use_value_cost:
         z_seq, h_seq = imagine_batch(
             dyn, z_start=z_start_b, action_plan=full, horizon=horizon, sched=sched,
             k_max=k_max, act_mask_1d=act_mask_1d, lang_emb=lang_emb, use_amp=use_amp,
-            return_h=True,
+            return_h=True, past_actions=past_actions_b, max_ctx=max_ctx,
         )
-        costs = reward_cost(rew_head, h_seq, use_amp=use_amp, discount=discount)
+        if use_combined_cost:
+            costs = combined_cost(
+                rew_head, h_seq=h_seq, z_seq=z_seq, z_goal=z_goal,
+                use_amp=use_amp, discount=discount, goal_weight=goal_weight,
+                scale=goal_scale(z_start, z_goal),
+            )
+        elif use_value_cost:
+            costs = value_cost(
+                rew_head, value_head, h_seq=h_seq, use_amp=use_amp, discount=discount,
+            )
+        else:
+            costs = reward_cost(rew_head, h_seq, use_amp=use_amp, discount=discount)
     else:
         z_seq = imagine_batch(
             dyn, z_start=z_start_b, action_plan=full, horizon=horizon, sched=sched,
             k_max=k_max, act_mask_1d=act_mask_1d, lang_emb=lang_emb, use_amp=use_amp,
+            past_actions=past_actions_b, max_ctx=max_ctx,
         )
         costs = latent_cost(z_seq, z_goal, kind=cost_kind)
     z0 = z_seq[0].detach() if return_first_latents else None
@@ -478,6 +646,9 @@ def bc_rollout_integrated(
     z_start: torch.Tensor, horizon: int, act_dim: int,
     act_mask_1d: torch.Tensor, sched: dict, k_max: int,
     lang_emb: Optional[torch.Tensor], use_amp: bool,
+    past_actions: Optional[torch.Tensor] = None,
+    max_ctx: int = 0,
+    tau_ctx: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Closed-loop BC rollout using the *integrated* policy head.
 
@@ -492,64 +663,85 @@ def bc_rollout_integrated(
     a_1 at z_0 we need h_0 — obtained here via a one-shot prefill dynamics pass
     on past=[z_0] before the rollout loop starts.
 
+    `z_start` may be (n_spatial, d_spatial) or (t, n_spatial, d_spatial) to
+    seed the rollout with t real context frames; `past_actions` (t, 16) and
+    `max_ctx` follow the same convention as `imagine_batch`.
+
     Returns (z_seq, bc_plan):
-      z_seq: (1 + horizon, n_spatial, d_spatial) with z_seq[0] = z_start
+      z_seq: (1 + horizon, n_spatial, d_spatial) with z_seq[0] = the last
+        context frame
       bc_plan: (horizon, act_dim) of the post-clip, post-mask actions taken
     """
     device = z_start.device
     emax = int(round(math.log2(int(k_max))))
-    n_spatial, d_spatial = z_start.shape
     lang_emb_1 = lang_emb.expand(1, -1) if lang_emb is not None else None
 
-    past = z_start.unsqueeze(0).unsqueeze(0).contiguous()   # (1, 1, n_spatial, d_spatial)
-    full_actions = torch.zeros((1, horizon + 1, 16), device=device, dtype=torch.float32)
-    full_mask = act_mask_1d.view(1, 1, -1).expand(1, horizon + 1, -1).contiguous()
+    if z_start.dim() == 2:
+        past = z_start.unsqueeze(0).unsqueeze(0).contiguous()   # (1, 1, n_spatial, d_spatial)
+    elif z_start.dim() == 3:
+        past = z_start.unsqueeze(0).contiguous()                # (1, t, n_spatial, d_spatial)
+    else:
+        raise ValueError(f"z_start must be 2D or 3D, got shape {tuple(z_start.shape)}")
+    t_ctx = past.shape[1]
 
-    # Prefill: one clean dynamics pass on past=[z_0] to extract h_0 (the agent-
-    # token state at slot 0). step_idx=emax + signal_idx=k_max mark the slot as
-    # fully denoised (matches how context slots are flagged in the denoising
-    # sampler, so behavior is consistent with the learned training distribution).
+    full_actions = torch.zeros((1, t_ctx + horizon, 16), device=device, dtype=torch.float32)
+    if past_actions is not None:
+        if tuple(past_actions.shape) != (t_ctx, 16):
+            raise ValueError(
+                f"past_actions shape {tuple(past_actions.shape)} != (t={t_ctx}, 16)"
+            )
+        full_actions[0, :t_ctx] = past_actions.to(device=device, dtype=full_actions.dtype)
+    full_mask = act_mask_1d.view(1, 1, -1).expand(1, t_ctx + horizon, -1).contiguous()
+
+    # Prefill: one clean dynamics pass over the context to extract h at the last
+    # context slot. step_idx=emax + signal_idx=k_max mark those slots as fully
+    # denoised (matches how context slots are flagged in the denoising sampler,
+    # so behavior is consistent with the learned training distribution).
+    pre_start = max(0, t_ctx - max_ctx) if max_ctx > 0 else 0
+    n_pre = t_ctx - pre_start
     with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
-        step_idx_pre = torch.full((1, 1), emax, device=device, dtype=torch.long)
-        sig_idx_pre = torch.full((1, 1), int(k_max), device=device, dtype=torch.long)
+        step_idx_pre = torch.full((1, n_pre), emax, device=device, dtype=torch.long)
+        sig_idx_pre = torch.full((1, n_pre), int(k_max), device=device, dtype=torch.long)
         _, h_full = dyn(
-            full_actions[:, :1],
+            full_actions[:, pre_start:t_ctx],
             step_idx_pre,
             sig_idx_pre,
-            past,
-            act_mask=full_mask[:, :1],
+            past[:, pre_start:],
+            act_mask=full_mask[:, pre_start:t_ctx],
             agent_tokens=None,
             lang_emb=lang_emb_1,
         )
     if h_full is None:
         raise RuntimeError("bc_rollout_integrated: dynamics returned h_t=None; need n_agent>0 ckpt.")
-    h_cur = h_full[:, -1:]  # (1, 1, n_agent, D) — h at slot 0
+    h_cur = h_full[:, -1:]  # (1, 1, n_agent, D) — h at the last context slot
 
     bc_plan = torch.zeros((horizon, act_dim), device=device, dtype=torch.float32)
     for t in range(horizon):
         with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
             a_all = policy_head(h_cur)     # (1, 1, L, A)  -- tanh-squashed in [-1,1]
         a_pred = a_all[:, 0, 0, :act_dim].float().clamp(-1.0, 1.0).squeeze(0)
-        full_actions[0, t + 1, :act_dim] = a_pred * act_mask_1d[:act_dim]
+        n_ctx = past.shape[1]
+        full_actions[0, n_ctx, :act_dim] = a_pred * act_mask_1d[:act_dim]
         bc_plan[t] = a_pred
 
+        start = max(0, n_ctx - max_ctx) if max_ctx > 0 else 0
         z_next, h_new, _inst = sample_one_timestep_packed(
             dyn,
-            past_packed=past,
+            past_packed=past[:, start:],
             k_max=k_max,
             sched=sched,
-            actions=full_actions[:, : past.shape[1] + 1],
-            act_mask=full_mask[:, : past.shape[1] + 1],
+            actions=full_actions[:, start: n_ctx + 1],
+            act_mask=full_mask[:, start: n_ctx + 1],
             use_amp=use_amp,
             return_h=True,
-            tau_ctx=0.0,
+            tau_ctx=tau_ctx,
             lang_emb=lang_emb_1,
             use_kv_cache=True,
         )
         past = torch.cat([past, z_next.unsqueeze(1)], dim=1)
-        h_cur = h_new  # (1, 1, n_agent, D) — h at newly predicted slot t+1
+        h_cur = h_new  # (1, 1, n_agent, D) — h at newly predicted slot
 
-    return past[0], bc_plan
+    return past[0, t_ctx - 1:], bc_plan
 
 
 def build_models(args, device):
@@ -607,6 +799,7 @@ def plan_one(
     rng: torch.Generator,
     rew_head=None,
     policy_head=None,
+    value_head=None,
 ) -> Optional[dict]:
     H_img, W_img, C, patch = int(info["H"]), int(info["W"]), int(info["C"]), int(info["patch"])
     n_spatial, packing_factor = int(info["n_spatial"]), int(info["packing_factor"])
@@ -652,6 +845,14 @@ def plan_one(
         if device.type == "cuda":
             torch.cuda.synchronize()
 
+    # Cost-function arguments shared by every scoring call in this plan.
+    cost_kw = dict(
+        rew_head=rew_head,
+        value_head=value_head,
+        goal_weight=float(getattr(args, "goal_weight", 0.0)),
+        discount=float(getattr(args, "discount", 1.0)),
+    )
+
     # Warm-start: BC rollout -> action sequence used to seed CEM's mu.
     bc_init_plan = None
     cost_bc_init = float("nan")
@@ -673,7 +874,7 @@ def plan_one(
             act_dim=act_dim, act_mask_1d=act_mask_1d, horizon=horizon,
             sched=sched, k_max=k_max, lang_emb=lang_emb, cost_kind=args.cost,
             use_amp=use_amp, device=device, n_rollouts=args.baseline_rollouts,
-            rew_head=rew_head,
+            **cost_kw,
         )
         _sync(); dt_bcs = time.time() - t_bcs
         print(f"  [bc-warm] rollout={dt_bcr:.2f}s  rescore={dt_bcs:.2f}s  "
@@ -694,7 +895,7 @@ def plan_one(
         device=device, use_amp=use_amp, generator=rng,
         init_mu=bc_init_plan,
         n_rollouts_elite=int(args.cem_n_rollouts),
-        rew_head=rew_head,
+        **cost_kw,
     )
     _sync(); dt_cem = time.time() - t_cem
     print(f"  [cem] {dt_cem:.2f}s  n_samples={args.cem_samples} iters={args.cem_iters} "
@@ -709,21 +910,21 @@ def plan_one(
         sched=sched, k_max=k_max, lang_emb=lang_emb, cost_kind=args.cost,
         use_amp=use_amp, device=device, n_rollouts=args.baseline_rollouts,
         return_first_latents=True,
-        rew_head=rew_head,
+        **cost_kw,
     )
     cost_rand, _ = score_plan(
         dyn, z_start=z_start, z_goal=z_goal, action_plan=rand_plan,
         act_dim=act_dim, act_mask_1d=act_mask_1d, horizon=horizon,
         sched=sched, k_max=k_max, lang_emb=lang_emb, cost_kind=args.cost,
         use_amp=use_amp, device=device, n_rollouts=args.baseline_rollouts,
-        rew_head=rew_head,
+        **cost_kw,
     )
     cost_shuf, _ = score_plan(
         dyn, z_start=z_start, z_goal=z_goal, action_plan=shuf_plan,
         act_dim=act_dim, act_mask_1d=act_mask_1d, horizon=horizon,
         sched=sched, k_max=k_max, lang_emb=lang_emb, cost_kind=args.cost,
         use_amp=use_amp, device=device, n_rollouts=args.baseline_rollouts,
-        rew_head=rew_head,
+        **cost_kw,
     )
     cost_cem, z_seq_cem = score_plan(
         dyn, z_start=z_start, z_goal=z_goal, action_plan=out["best_plan"],
@@ -731,7 +932,7 @@ def plan_one(
         sched=sched, k_max=k_max, lang_emb=lang_emb, cost_kind=args.cost,
         use_amp=use_amp, device=device, n_rollouts=args.baseline_rollouts,
         return_first_latents=True,
-        rew_head=rew_head,
+        **cost_kw,
     )
     _sync(); dt_sc = time.time() - t_sc
     print(f"  [score] {dt_sc:.2f}s  gt={cost_gt:.3f} rand={cost_rand:.3f} "
@@ -824,13 +1025,30 @@ def evaluate(args):
 
     encoder, decoder, dyn, rew_head, policy_head, sched, info = build_models(args, device)
     use_amp = bool(args.amp) and device.type == "cuda"
-    if str(args.cost) in REWARD_COST_KINDS and rew_head is None:
+    if needs_reward_head(args.cost) and rew_head is None:
         raise SystemExit(
             f"--cost={args.cost!r} requires a reward head in the dynamics ckpt. "
             f"Loaded ckpt {args.dynamics_ckpt!r} has none; use a ckpt "
             f"trained with --reward_weight > 0 and --n_agent > 0, or switch "
             f"--cost back to {'|'.join(LATENT_COST_KINDS)}."
         )
+
+    value_head = None
+    if needs_value_head(args.cost):
+        if not getattr(args, "value_ckpt", ""):
+            raise SystemExit(
+                f"--cost={args.cost!r} requires --value_ckpt pointing at a value head "
+                f"trained by train_heads_offline.py."
+            )
+        from heads_rl import load_value_head_from_ckpt
+        value_head = load_value_head_from_ckpt(args.value_ckpt, device)
+        print(f"[plan_cem] loaded value head from {args.value_ckpt}")
+        if float(getattr(args, "discount", 1.0)) == 1.0:
+            print("[plan_cem] WARNING: --cost=reward_value with --discount=1.0. The "
+                  "terminal value term is only on the same scale as the predicted "
+                  "return when discount matches the gamma the value head was fitted "
+                  "with (default 0.997 in train_heads_offline.py).")
+
     if str(args.warm_start) == "bc" and policy_head is None:
         raise SystemExit(
             f"--warm_start=bc requires a policy head in the dynamics ckpt. "
@@ -877,7 +1095,7 @@ def evaluate(args):
                 episode=epi, start_idx=int(s),
                 act_dim=act_dim, act_mask_1d=act_mask_1d, lang_emb=lang_emb,
                 rng=torch_rng,
-                rew_head=rew_head, policy_head=policy_head,
+                rew_head=rew_head, policy_head=policy_head, value_head=value_head,
             )
             plan_idx += 1
             if row is None:
@@ -923,6 +1141,13 @@ def evaluate(args):
         print(f"  (reward_gt > reward_random) rate : {(r_gt > r_rnd).mean():.1%}    <- validation #1 (predicted reward is informative)")
         print(f"  (reward_cem >= reward_gt)   rate : {(r_cem >= r_gt).mean():.1%}  <- validation #2 (CEM >= GT predicted return)")
         print(f"  reward_cem - reward_gt : mean={(r_cem - r_gt).mean():+.3f}  median={np.median(r_cem - r_gt):+.3f}  (positive = CEM improves on GT)")
+    elif str(args.cost) in COMBINED_COST_KINDS:
+        # Mixed sign (negated return plus a non-negative distance), so neither
+        # the relative error nor the gt*1.1 tolerance is meaningful here.
+        print(f"  (gt < random)        rate : {(gt < rnd).mean():.1%}    <- validation #1 (cost is informative)")
+        print(f"  (cem <= gt)          rate : {(cem <= gt).mean():.1%}  <- validation #2 (CEM matches or beats GT)")
+        print(f"  (cem < random)       rate : {(cem < rnd).mean():.1%}")
+        print(f"  cem - gt             : mean={(cem - gt).mean():+.3f}  median={np.median(cem - gt):+.3f}  (negative = CEM improves on GT)")
     else:
         print(f"  (gt < random)        rate : {(gt < rnd).mean():.1%}    <- validation #1 (cost is informative)")
         print(f"  (cem <= gt * 1.1)    rate : {(cem <= gt * 1.1).mean():.1%}  <- validation #2 (CEM recovers expert-quality plans)")
@@ -969,14 +1194,31 @@ def main():
     # planning problem
     p.add_argument(
         "--cost", type=str, default="terminal",
-        choices=list(LATENT_COST_KINDS) + list(REWARD_COST_KINDS),
+        choices=list(ALL_COST_KINDS),
         help=(
             "CEM cost. Latent modes ({LATENT}) score z_seq vs z_goal "
             "(reward-head-free). 'reward' uses the dynamics ckpt's reward head: "
-            "cost = -sum_t r_hat_t (l=0 MTP slot at each rollout step). Requires "
-            "a ckpt trained with n_agent>0 and reward_weight>0."
+            "cost = -sum_t r_hat_t (l=0 MTP slot at each rollout step). "
+            "'reward_terminal' adds --goal_weight * normalized terminal latent "
+            "distance to the predicted return, as a stand-in for a value "
+            "function. 'reward_value' replaces that stand-in with a learned "
+            "terminal value: cost = -sum_t gamma^t r_hat_t - gamma^H V(h_H), "
+            "requiring --value_ckpt and needing no goal latent. All reward "
+            "modes require a ckpt trained with n_agent>0 and reward_weight>0."
         ).format(LATENT="|".join(LATENT_COST_KINDS)),
     )
+    p.add_argument("--goal_weight", type=float, default=0.25,
+                   help="(--cost=reward_terminal only) weight of the terminal "
+                        "latent-distance term, normalized by the start-to-goal "
+                        "distance, so 1.0 costs one full start-to-goal distance "
+                        "per unit of predicted return.")
+    p.add_argument("--value_ckpt", type=str, default="",
+                   help="(--cost=reward_value only) value head from "
+                        "train_heads_offline.py, used as the terminal value.")
+    p.add_argument("--discount", type=float, default=1.0,
+                   help="per-step gamma on predicted reward. 1.0 (default) keeps the "
+                        "undiscounted open-loop behavior; with --cost=reward_value set "
+                        "this to the gamma the value head was fitted with (0.997).")
     p.add_argument("--n_episodes", type=int, default=4)
     p.add_argument("--n_starts_per_ep", type=int, default=3)
     p.add_argument("--max_start_frame", type=int, default=5,

@@ -233,3 +233,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# AI agent / assistant local state (CLAUDE.md is tracked upstream; local edits stay uncommitted)
+.memsearch/
+.context-mode/
+CLAUDE.local.md
+.cursor/
+.aider*
+.codex/
+.gemini/
+.continue/
+
+# Experiment artifacts (rendered media, weights, arrays)
+*.mp4
+*.gif
+*.safetensors
+*.ckpt
+*.pth
+*.npy
+*.pkl
+*.h5
+*.hdf5

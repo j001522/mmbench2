@@ -73,6 +73,9 @@ class PerDomainAccumulator:
         return means, count
 
 
+DEFAULT_RESUME = "./logs/dynamics_ckpts/latest.pt"
+
+
 def get_dist_info():
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1410,12 +1413,22 @@ def train(args):
     step = 0
     start_epoch = 0
     ckpt_dir = Path(args.ckpt_dir)
-    if args.resume is not None:
-        step, start_epoch = load_ckpt(Path(args.resume), dyn_model=dyn, rew_head=rew_head, policy_head=policy_head, opt=opt,
+    resume_path = Path(args.resume) if args.resume is not None else None
+    if resume_path is not None and not resume_path.exists():
+        # A fresh run has no latest.pt yet; only the default path may be absent —
+        # an explicit --resume that does not exist is a typo, not a fresh start.
+        if resume_path == Path(DEFAULT_RESUME):
+            if is_rank0():
+                print(f"[rank0] No checkpoint at {resume_path}; starting from scratch.")
+            resume_path = None
+        else:
+            raise FileNotFoundError(f"--resume {resume_path} does not exist")
+    if resume_path is not None:
+        step, start_epoch = load_ckpt(resume_path, dyn_model=dyn, rew_head=rew_head, policy_head=policy_head, opt=opt,
                                       rms_objects={"flow": rms_flow, "rew": rms_rew, "bc": rms_bc},
                                       strict=args.resume_strict)
         if is_rank0():
-            print(f"[rank0] Resumed from {args.resume} (step={step}, epoch={start_epoch})")
+            print(f"[rank0] Resumed from {resume_path} (step={step}, epoch={start_epoch})")
     # Count LR warmup from the resume point, so fine-tuning resumes (which start
     # at a high step) still warm up. Fresh starts have resume_step=0 (warmup from
     # step 0).
@@ -1426,6 +1439,9 @@ def train(args):
     if rew_head is not None:
         rew_head.train()
     t0 = time.time()
+    # Rolling step-rate window, reset at every log line (t0 alone would average
+    # in startup and any eval/validation pass).
+    t_win, step_win = t0, step
     grad_accum = max(1, int(args.grad_accum))
 
     # Per-domain flow-mse accumulator (flushed at each log_every cycle).
@@ -1726,12 +1742,17 @@ def train(args):
                             wandb.log(dom_payload, step=step)
 
                     # Log to console
+                    now = time.time()
+                    s_per_step = (now - t_win) / max(1, step - step_win)
+                    t_win, step_win = now, step
                     print(
                         f"step {step:07d} | loss={loss.item():.6f} "
                         f"| flow_mse={aux['flow_mse'].item():.6f} "
                         f"| boot_mse={aux['bootstrap_mse'].item():.6f} "
                         f"| rew_ce={aux['loss_rew'].item():.6f} "
-                        f"| sigma={aux['sigma_mean'].item():.3f} | gnorm={grad_norm:.3f} | B_self={B_self}"
+                        f"| sigma={aux['sigma_mean'].item():.3f} | gnorm={grad_norm:.3f} | B_self={B_self} "
+                        f"| {s_per_step:.3f}s/step | {(now - t0) / 3600.0:.2f}h",
+                        flush=True,
                     )
 
                 # Checkpointing
@@ -1890,7 +1911,7 @@ if __name__ == "__main__":
     # ckpt
     p.add_argument("--ckpt_dir", type=str, default="./logs/dynamics_ckpts")
     p.add_argument("--save_every", type=int, default=5_000)
-    p.add_argument("--resume", type=str, default="./logs/dynamics_ckpts/latest.pt")
+    p.add_argument("--resume", type=str, default=DEFAULT_RESUME)
     p.add_argument("--resume_strict", action="store_true", default=True,
                    help="Use strict=True when loading checkpoint (default). Use --no-resume_strict for finetuning with architecture changes (e.g. adding agent tokens).")
     p.add_argument("--no-resume_strict", dest="resume_strict", action="store_false")

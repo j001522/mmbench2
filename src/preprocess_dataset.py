@@ -26,6 +26,14 @@ def safe_save_frames(frames: torch.Tensor, out_path: Path) -> bool:
         # Ensure parent exists
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # torch.save writes the whole underlying storage, not just the view, so a
+        # slice of the concatenated buffer would carry the next shard's frames
+        # with it (~1.6x the bytes). Slicing along dim 0 keeps is_contiguous()
+        # True, so only the storage size reveals it; .contiguous() is a no-op
+        # here and .clone() is what actually drops the tail.
+        if frames.untyped_storage().nbytes() != frames.nbytes:
+            frames = frames.clone()
+
         # Write to temp
         torch.save({"frames": frames}, tmp_path)
 
@@ -158,9 +166,17 @@ def main(args):
     else:
         tasks = list(args.tasks)
     task_args = [(task, args.filedir, args.outdir, args.target_size, args.shard_size) for task in tasks]
-    print(f"Processing {len(tasks)} tasks with {args.num_workers} parallel workers")
+    workers = min(args.num_workers, len(tasks))
+    if workers <= 1:
+        # No pool for a single task: keeps small runs (and debugging) in one
+        # process, where a stack trace points at the actual work.
+        print(f"Processing {len(tasks)} tasks in-process")
+        for ta in task_args:
+            process_task(ta)
+        return
+    print(f"Processing {len(tasks)} tasks with {workers} parallel workers")
     ctx = mp.get_context("spawn")
-    with ctx.Pool(processes=args.num_workers) as pool:
+    with ctx.Pool(processes=workers) as pool:
         pool.map(process_task, task_args)
 
 

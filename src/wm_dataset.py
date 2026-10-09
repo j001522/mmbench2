@@ -103,20 +103,24 @@ class WMDataset(Dataset):
                     found_tasks.append(t)
 
         if self.tasks_filter is not None:
-            requested = [t for t in tasks if t in self.tasks_filter] if tasks is not None else []
-            if len(requested) == 0:
-                requested = [t for t in found_tasks if t in self.tasks_filter]
-            tasks = requested
+            # Keep only requested tasks that actually have a demo .pt on disk,
+            # in the order they were requested. Callers legitimately ask for a
+            # superset (e.g. UNSEEN_TASK_SET, whose demos exist only during
+            # targeted-collection fine-tunes), so missing tasks are dropped
+            # rather than fatal; a filter that matches nothing is still fatal.
+            requested = tasks if tasks is not None else found_tasks
+            tasks = [t for t in requested if t in self.tasks_filter and t in seen]
 
+            missing = [t for t in self.tasks_filter if t not in seen]
             if self.verbose:
-                missing = [t for t in self.tasks_filter if t not in set(found_tasks)]
                 print(f"[WMDataset] Task filter: keeping {len(tasks)}/{len(found_tasks)} tasks")
                 if missing:
-                    msg = f"[WMDataset] WARNING: {len(missing)} requested tasks not found in data_dir(s) (e.g. {missing[:5]})"
-                    if self.strict_tasks:
-                        raise FileNotFoundError(msg)
-                    else:
-                        print(msg)
+                    print(f"[WMDataset] WARNING: {len(missing)} requested tasks not found in data_dir(s) (e.g. {missing[:5]})")
+            if self.strict_tasks and len(tasks) == 0:
+                raise FileNotFoundError(
+                    f"[WMDataset] none of the {len(self.tasks_filter)} requested tasks were found "
+                    f"in data_dir(s) {self.data_dirs}"
+                )
         else:
             tasks = found_tasks
 
