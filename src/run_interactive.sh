@@ -17,7 +17,7 @@ cd "$(dirname "$0")"                 # run from src/ (scripts use flat imports)
 
 VARIANT="combined"
 case "${1:-}" in
-    base|coverage_aware|combined) VARIANT="$1"; shift ;;
+    (base|coverage_aware|combined) VARIANT="$1"; shift ;;
 esac
 
 CKPT_DIR="${CKPT_DIR:-./checkpoints}"

@@ -143,6 +143,8 @@ def imagine_batch(
     use_kv_cache: bool = True,
     past_actions: Optional[torch.Tensor] = None,
     max_ctx: int = 0,
+    return_unc: bool = False,
+    unc_seeds: int = 1,
     tau_ctx: float = 0.0,
 ):
     """
@@ -178,6 +180,16 @@ def imagine_batch(
         l=0 predicts r_t = the reward received from applying action_plan[t].
         Summing these H predictions gives the total predicted return over
         the plan.
+      return_unc=True: always (z_seq, h_seq_or_None, u_f, u_s_or_None), both
+        (B, H) float32 for the step that produced z_seq[:, t+1]:
+        u_f  flow instability of that denoising run
+             (see interactive.sample_one_timestep_packed).
+        u_s  with unc_seeds=N>1, the paper's inter-seed variance: N denoising
+             seeds of the next latent from the same context and action,
+             variance over seeds averaged over latent elements (identical to
+             uncertainty.CrossSeedScorer). Seed 0 continues the rollout (the
+             released curiosity code continues from the seed mean instead),
+             so z_seq/h_seq/u_f are exactly one ordinary rollout.
 
     use_kv_cache=True (default): at each rollout step, prefill the
     transformer's K,V for the past context tokens once and reuse them
@@ -213,6 +225,9 @@ def imagine_batch(
 
     z_outs = [past[:, -1]]
     h_outs: List[torch.Tensor] = []
+    uf_outs: List[torch.Tensor] = []
+    us_outs: List[torch.Tensor] = []
+    n_s = max(1, int(unc_seeds)) if return_unc else 1
     for t in range(horizon):
         n_ctx = past.shape[1]
         # Slice latents and actions with the same window so action[i] keeps
@@ -221,6 +236,8 @@ def imagine_batch(
         z_win = past[:, start:]
         a_win = full_actions[:, start: n_ctx + 1]
         m_win = full_mask[:, start: n_ctx + 1]
+        if n_s > 1:
+            z_win, a_win, m_win = (x.repeat_interleave(n_s, dim=0) for x in (z_win, a_win, m_win))
         out = sample_one_timestep_packed(
             dyn,
             past_packed=z_win,
@@ -231,19 +248,33 @@ def imagine_batch(
             use_amp=use_amp,
             return_h=return_h,
             tau_ctx=tau_ctx,
-            lang_emb=lang_emb.expand(B, -1) if lang_emb is not None else None,
+            lang_emb=lang_emb.expand(B * n_s, -1) if lang_emb is not None else None,
             use_kv_cache=use_kv_cache,
+            per_sample_instability=return_unc,
         )
         if return_h:
-            z_next, h_new, _ = out
-            h_outs.append(h_new[:, 0])  # (B, n_agent, D) or (B, D)
+            z_next, h_new, inst = out
         else:
-            z_next, _ = out
+            z_next, inst = out
+        if n_s > 1:
+            z_all = z_next.reshape(B, n_s, *z_next.shape[1:])
+            us_outs.append(z_all.float().var(dim=1).flatten(1).mean(1))    # (B,)
+            z_next = z_all[:, 0]
+            inst = inst.reshape(B, n_s)[:, 0]
+            if return_h:
+                h_new = h_new.reshape(B, n_s, *h_new.shape[1:])[:, 0]
+        if return_h:
+            h_outs.append(h_new[:, 0])  # (B, n_agent, D) or (B, D)
+        if return_unc:
+            uf_outs.append(inst.float())
         z_outs.append(z_next)
         past = torch.cat([past, z_next.unsqueeze(1)], dim=1)
 
     z_seq = torch.stack(z_outs, dim=1).to(torch.float32)
     h_seq = torch.stack(h_outs, dim=1) if return_h else None
+    if return_unc:
+        u_s = torch.stack(us_outs, dim=1) if us_outs else None
+        return z_seq, h_seq, torch.stack(uf_outs, dim=1), u_s
     if not return_h:
         return z_seq
     return z_seq, h_seq
