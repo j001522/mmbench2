@@ -292,6 +292,8 @@ COMBINED_COST_KINDS = ("reward_terminal",)
 # latent-distance term above stands in for. Needs a value head from
 # train_heads_offline.py (--value_ckpt) and needs no goal latent.
 VALUE_COST_KINDS = ("reward_value",)
+# predictors the CEM can penalize (cem_plan --unc_kind)
+UNC_KINDS = ("u_f", "u_r", "u_f_norm", "u_r_norm")
 ALL_COST_KINDS = (LATENT_COST_KINDS + REWARD_COST_KINDS
                   + COMBINED_COST_KINDS + VALUE_COST_KINDS)
 
@@ -450,6 +452,11 @@ def cem_plan(
     past_actions: Optional[torch.Tensor] = None,
     max_ctx: int = 0,
     tau_ctx: float = 0.0,
+    unc_weight: float = 0.0,
+    log_pop: bool = False,
+    log_K: int = 0,
+    unc_kind: str = "u_f",
+    ur_fn=None,
 ) -> dict:
     """Diagonal-Gaussian CEM over (horizon, act_dim) plans, clipped to [-1,1].
     `noise_beta` controls the time-axis noise color (0 = white, 2 = Brownian).
@@ -457,7 +464,38 @@ def cem_plan(
     `n_rollouts_elite` scores each sample by averaging over k denoising
     rollouts before elite selection (guards against single-rollout overfit).
     `z_start` may carry a leading context dimension (see `imagine_batch`);
-    `past_actions` and `max_ctx` are forwarded there unchanged."""
+    `past_actions` and `max_ctx` are forwarded there unchanged.
+
+    Uncertainty-aware selection (u_f, flow instability of the denoising run,
+    free from the sampler): every sample's u_f is its per-step instability
+    averaged over the H steps and its k rollouts. With unc_weight = c > 0,
+    elites and the returned plan are chosen by
+        obj = cost + lam * u_f,   lam = c * std(cost) / std(u_f)
+    with both stds taken over the iteration-0 population and then frozen for
+    the remaining iterations of this call (so `obj` stays comparable across
+    iterations for the running best). c reads as "cost std-devs per u_f
+    std-dev". c = 0 leaves the planner unchanged. `best_cost` is always the
+    task cost of the returned plan (without the penalty).
+
+    unc_kind="u_r" penalizes the tokenizer round-trip residual instead:
+    ur_fn maps imagined latents (N, S, D) -> (N,) RMS(z - enc(dec(z))) and is
+    applied to every step of every rollout (B*H decode+encode per batch, about
+    +26% planner time at B=64, H=32; predictor_cost.py). When ur_fn is given,
+    u_r is computed (and logged) whatever unc_kind is; u_f is always free.
+
+    log_pop=True returns out["pop"]: per iteration, per sample cost, u_f (and
+    u_r with ur_fn) and rollout motion (RMS z_{t+1}-z_t) averaged over the
+    first `log_K` steps and over all H, plus elite flags and which sample was
+    returned.
+
+    unc_kind="u_f_norm" / "u_r_norm": the motion-normalized predictors as in
+    paper_predictors.py / uncertainty.URNormScorer: per step u_t / max(m_t, 1e-3),
+    m_t = RMS(z_{t+1} - z_t) of the same rollout, then averaged over the steps
+    (logged as ufn_* / urn_*)."""
+    if unc_kind not in UNC_KINDS:
+        raise ValueError(f"unc_kind={unc_kind!r} not in {UNC_KINDS}")
+    if unc_kind.startswith("u_r") and float(unc_weight) != 0.0 and ur_fn is None:
+        raise ValueError(f"unc_kind={unc_kind!r} with unc_weight != 0 needs ur_fn")
     if init_mu is not None:
         assert init_mu.shape == (horizon, act_dim), \
             f"init_mu shape {tuple(init_mu.shape)} != (horizon={horizon}, act_dim={act_dim})"
@@ -475,6 +513,18 @@ def cem_plan(
     scale = goal_scale(z_start, z_goal) if needs_goal(cost_kind) else 1.0
 
     k_sel = max(1, int(n_rollouts_elite))
+    want_unc = float(unc_weight) != 0.0 or bool(log_pop)
+    K_log = int(log_K) if 0 < int(log_K) <= horizon else horizon
+    # per-sample uncertainty columns, each averaged over the first K / all H steps
+    cols = ["uf_K", "uf_H", "motion_K", "motion_H", "ufn_K", "ufn_H"] + (
+        ["ur_K", "ur_H", "urn_K", "urn_H"] if ur_fn is not None else [])
+    sel_col = {"u_f": "uf_H", "u_r": "ur_H", "u_f_norm": "ufn_H", "u_r_norm": "urn_H"}[unc_kind]
+    c_sel = cols.index(sel_col) if sel_col in cols else 1
+    lam = 0.0
+    best_obj = float("inf")
+    best_where = (-1, -1)
+    pop: List[dict] = []
+    pop_samples: List[torch.Tensor] = []
 
     for it in range(n_iters):
         noise = colored_noise(
@@ -502,18 +552,26 @@ def cem_plan(
             raise ValueError(f"cost_kind={cost_kind!r} requires a value head; got value_head=None")
 
         costs_flat = torch.empty(total, device=device, dtype=torch.float32)
+        if want_unc:
+            # (total, 4): u_f over first K, u_f over H, motion over K, motion over H
+            unc_flat = torch.empty((total, len(cols)), device=device, dtype=torch.float32)
         for s in range(0, total, rollout_batch):
             e = min(s + rollout_batch, total)
             z0_b = z_start_b.expand(e - s, *([-1] * (z_start.dim()))).contiguous()
             pa_b = (None if past_actions_b is None
                     else past_actions_b.expand(e - s, -1, -1).contiguous())
             if use_reward_cost or use_combined_cost or use_value_cost:
-                z_seq, h_seq = imagine_batch(
+                rolled = imagine_batch(
                     dyn, z_start=z0_b, action_plan=full_rep[s:e], horizon=horizon,
                     sched=sched, k_max=k_max, act_mask_1d=act_mask_1d,
                     lang_emb=lang_emb, use_amp=use_amp,
                     return_h=True, past_actions=pa_b, max_ctx=max_ctx, tau_ctx=tau_ctx,
+                    return_unc=want_unc, unc_seeds=1,
                 )
+                if want_unc:
+                    z_seq, h_seq, uf_seq, _ = rolled
+                else:
+                    z_seq, h_seq = rolled
                 if use_combined_cost:
                     costs_flat[s:e] = combined_cost(
                         rew_head, h_seq=h_seq, z_seq=z_seq, z_goal=z_goal,
@@ -528,25 +586,54 @@ def cem_plan(
                 else:
                     costs_flat[s:e] = reward_cost(rew_head, h_seq, use_amp=use_amp, discount=discount)
             else:
-                z_seq = imagine_batch(
+                rolled = imagine_batch(
                     dyn, z_start=z0_b, action_plan=full_rep[s:e], horizon=horizon,
                     sched=sched, k_max=k_max, act_mask_1d=act_mask_1d,
                     lang_emb=lang_emb, use_amp=use_amp,
                     past_actions=pa_b, max_ctx=max_ctx, tau_ctx=tau_ctx,
+                    return_unc=want_unc, unc_seeds=1,
                 )
+                if want_unc:
+                    z_seq, _, uf_seq, _ = rolled
+                else:
+                    z_seq = rolled
                 costs_flat[s:e] = latent_cost(z_seq, z_goal, kind=cost_kind)
+            if want_unc:
+                mot = (z_seq[:, 1:] - z_seq[:, :-1]).float().pow(2).flatten(2).mean(2).sqrt()  # (b, H)
+                mot_c = mot.clamp(min=1e-3)
+                ufn = uf_seq / mot_c
+                parts = [uf_seq[:, :K_log].mean(1), uf_seq.mean(1),
+                         mot[:, :K_log].mean(1), mot.mean(1),
+                         ufn[:, :K_log].mean(1), ufn.mean(1)]
+                if ur_fn is not None:
+                    ur = ur_fn(z_seq[:, 1:].flatten(0, 1)).view(e - s, horizon)  # (b, H)
+                    urn = ur / mot_c
+                    parts += [ur[:, :K_log].mean(1), ur.mean(1),
+                              urn[:, :K_log].mean(1), urn.mean(1)]
+                unc_flat[s:e] = torch.stack(parts, dim=1)
 
         costs = costs_flat.view(n_samples, k_sel).mean(dim=1)
+        if want_unc:
+            unc_s = unc_flat.view(n_samples, k_sel, len(cols)).mean(dim=1)  # (n_samples, n_cols)
+            u_sel = unc_s[:, c_sel]                                      # penalized u over H
+            if it == 0 and float(unc_weight) != 0.0:
+                lam = float(unc_weight) * float(costs.std()) / max(float(u_sel.std()), 1e-8)
+            obj = costs + lam * u_sel
+        else:
+            obj = costs
 
-        elite_idx = torch.topk(costs, k=n_elites, largest=False).indices
+        elite_idx = torch.topk(obj, k=n_elites, largest=False).indices
         elites = samples[elite_idx]
         new_mu = elites.mean(dim=0)
         new_std = elites.std(dim=0).clamp_min(float(min_std))
 
+        iter_best_obj = float(obj[elite_idx[0]].item())
         iter_best_cost = float(costs[elite_idx[0]].item())
-        if iter_best_cost < best_cost:
+        if iter_best_obj < best_obj:
+            best_obj = iter_best_obj
             best_cost = iter_best_cost
             best_plan = samples[elite_idx[0]].clone()
+            best_where = (it, int(elite_idx[0]))
 
         history.append({
             "iter": it,
@@ -555,11 +642,32 @@ def cem_plan(
             "best_cost": float(iter_best_cost),
             "running_best_cost": float(best_cost),
             "n_rollouts_elite": int(k_sel),
+            **({"lam": lam, "mean_u": float(u_sel.mean()),
+                "elite_mean_u": float(u_sel[elite_idx].mean())} if want_unc else {}),
         })
+        if log_pop:
+            is_elite = torch.zeros(n_samples, dtype=torch.bool, device=device)
+            is_elite[elite_idx] = True
+            r4 = lambda x: [round(float(v), 5) for v in x.tolist()]
+            pop.append({"cost": r4(costs),
+                        **{c: r4(unc_s[:, j]) for j, c in enumerate(cols)},
+                        "elite": is_elite.int().tolist()})
+            pop_samples.append(samples.clone())
         mu, std = new_mu, new_std
 
-    return {"best_plan": best_plan, "best_cost": float(best_cost), "history": history,
-            "mu": mu, "std": std}
+    out = {"best_plan": best_plan, "best_cost": float(best_cost), "history": history,
+           "mu": mu, "std": std}
+    if want_unc:
+        out["unc_lam"] = float(lam)
+        out["best_obj"] = float(best_obj)
+    if log_pop:
+        out["pop"] = {"iters": pop, "chosen_iter": best_where[0], "chosen_idx": best_where[1],
+                      "unc_weight": float(unc_weight), "unc_kind": str(unc_kind),
+                      "lam": float(lam), "K": K_log}
+        # The sampled plans themselves (per iteration, (n_samples, H, act_dim));
+        # kept out of "pop" so it stays JSON-serializable. Used by --pop_truth.
+        out["pop_samples"] = pop_samples
+    return out
 
 
 # -------------------- reference-plan scoring (with returned latents) -------------------- #
@@ -1078,7 +1186,7 @@ def evaluate(args):
             print("[plan_cem] WARNING: --cost=reward_value with --discount=1.0. The "
                   "terminal value term is only on the same scale as the predicted "
                   "return when discount matches the gamma the value head was fitted "
-                  "with (default 0.997 in train_heads_offline.py).")
+                  "with (default 0.99 in train_heads_offline.py).")
 
     if str(args.warm_start) == "bc" and policy_head is None:
         raise SystemExit(
@@ -1249,7 +1357,7 @@ def main():
     p.add_argument("--discount", type=float, default=1.0,
                    help="per-step gamma on predicted reward. 1.0 (default) keeps the "
                         "undiscounted open-loop behavior; with --cost=reward_value set "
-                        "this to the gamma the value head was fitted with (0.997).")
+                        "this to the gamma the value head was fitted with (0.99).")
     p.add_argument("--n_episodes", type=int, default=4)
     p.add_argument("--n_starts_per_ep", type=int, default=3)
     p.add_argument("--max_start_frame", type=int, default=5,

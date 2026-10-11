@@ -140,6 +140,32 @@ class SimHandle:
             raise RuntimeError("sim_planner: env state not restored exactly")
         return out
 
+    def returns_last_frames(self, plans, render_fn, n_last, discount=1.0):
+        """sim.returns, also rendering the frames after each of the last
+        n_last steps of every plan (for a learned terminal value on the true
+        state). Returns (returns (N,), frames: N lists of (3, H, W) uint8,
+        n_steps (N,) steps actually taken; < H if the episode ended)."""
+        base = self.save()
+        out = np.zeros(len(plans))
+        frames, n_steps = [], np.zeros(len(plans), dtype=int)
+        for i, p in enumerate(plans):
+            self.restore(base)
+            g, fr, T = 1.0, [], len(p)
+            for t, a in enumerate(p):
+                r, done = self.step(a)
+                out[i] += g * r
+                g *= discount
+                n_steps[i] = t + 1
+                if t >= T - n_last:
+                    fr.append(render_fn())
+                if done:
+                    break
+            frames.append(fr)
+        self.restore(base)
+        if not self.same(base):
+            raise RuntimeError("sim_planner: env state not restored exactly")
+        return out, frames, n_steps
+
     def rollout_frames(self, plan, render_fn):
         """Execute `plan` (K, real_dim), render after each step with
         render_fn(), restore. Returns (frames list, rewards)."""
@@ -168,11 +194,13 @@ def to_env_actions(plans, act_mask_1d, real_dim):
 
 
 def sim_cem_plan(sim, *, horizon, act_dim, act_mask_1d, real_dim, n_samples, n_elites, n_iters,
-                 init_std, min_std, noise_beta, device, generator=None, init_mu=None, discount=1.0):
+                 init_std, min_std, noise_beta, device, generator=None, init_mu=None, discount=1.0,
+                 score_fn=None):
     """plan_cem.cem_plan with the simulator as the model and the true reward
     as the objective: same sampling (colored_noise from `generator`), elite
     update and returned plan (the best sample seen). Deterministic sim, so
-    one rollout per candidate."""
+    one rollout per candidate. score_fn(samples (N, H, act_dim) model space)
+    -> (N,) objective replaces the true return (e.g. return + terminal value)."""
     if init_mu is not None:
         mu = init_mu.detach().to(device=device, dtype=torch.float32).clamp(-1.0, 1.0).clone()
     else:
@@ -182,7 +210,8 @@ def sim_cem_plan(sim, *, horizon, act_dim, act_mask_1d, real_dim, n_samples, n_e
     for it in range(n_iters):
         noise = colored_noise(n_samples, horizon, act_dim, float(noise_beta), device=device, generator=generator)
         samples = (mu + std * noise).clamp(-1.0, 1.0)
-        R = sim.returns(to_env_actions(samples, act_mask_1d, real_dim), discount=discount)
+        R = (score_fn(samples) if score_fn is not None
+             else sim.returns(to_env_actions(samples, act_mask_1d, real_dim), discount=discount))
         costs = -torch.as_tensor(R, device=device, dtype=torch.float32)
         elite_idx = torch.topk(costs, k=n_elites, largest=False).indices
         elites = samples[elite_idx]

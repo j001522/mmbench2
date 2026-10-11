@@ -11,7 +11,11 @@ All code lives under `src/`:
 - `train_tokenizer.py` / `train_dynamics.py` — the two training stages (a causal video tokenizer, then a block-causal flow-matching dynamics model with reward and behavior-cloning heads).
 - `uncertainty.py` — the hallucination predictors `u_r` / `u_f` / `u_s` (motion-normalized).
 - `collect_data.py` / `curiosity.py` — curiosity-driven targeted data collection.
-- `plan_cem.py` — evaluation via CEM planning.
+- `plan_cem.py` — evaluation via CEM planning; `--cost reward_value` adds a learned terminal value `gamma^H V(h_H)` to the predicted return.
+- `plan_mpc_env.py` — closed-loop MPC in the real environment (CEM, `--policy bc`, or `--policy random`); writes per-episode JSON, a summary CSV, and a real | world-model side-by-side video. Investigation extras: `--compare_sim` (true-model CEM via `sim_planner.py`, regret), `--halluc` (`plan_halluc.py` chunk labels), `--log_unc` (u_r/u_f/u_s per replan).
+- `train_heads_offline.py` — fits new heads on the agent tokens `h_t` of the FROZEN world model (asserted at startup): a value head (symexp two-hot, TD(λ) targets from real rewards, γ=0.99 (paper: 0.997), λ=0.95, as dreamer_v4 phase 3) and a stochastic BC head (`--policy_type gaussian|categorical`, `--bc_L 1` = next action only). Val reports BC NLL/MSE and the value head against real discounted returns.
+- `heads_rl.py` — the value / Gaussian / categorical policy heads and their checkpoint loaders; `rl_algorithms.py` — λ-returns and the value loss (`test_rl_algorithms.py`).
+- Investigation (hallucination predictors / masks / metrics / plots): `hallucination_labels.py`, `mask_metrics.py`, `paper_predictors.py`, `roc_*.py`, `predictor_cost*.py`, `plan_regret.py`, `plan_figures.py`, `plot_unc_episode.py`, `dino_*`/`clef_*`/`vlm_judge_metrics.py`, `eval_annotations.py`, `export_annotation_set.py`, `metric_io.py`.
 - `interactive.py` (+ `interactive.html`) — the browser interface for open-ended interaction with the model.
 - `wm_dataset.py`, `sharded_frame_dataset.py`, `preprocess_dataset.py`, `task_set.py` — dataset loading and preprocessing.
 - `envs/` — Gymnasium-compatible simulators for every task.

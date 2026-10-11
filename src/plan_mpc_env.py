@@ -63,6 +63,7 @@ from interactive import make_tau_schedule, sample_one_timestep_packed, unpack_sp
 from model import temporal_unpatchify
 from plan_halluc import hausdorff as mask_hausdorff
 from sim_planner import SimHandle, sim_cem_plan, to_env_actions
+from train_heads_offline import extract_h
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -415,15 +416,24 @@ def plan_distance(a: torch.Tensor, b: torch.Tensor, K: int, act_mask_1d: torch.T
     mu_std=(cem_out_a, cem_out_b), also w2: the 2-Wasserstein distance between
     the final CEM elite Gaussians over the K steps (diagonal: per dim
     sqrt((mu_a-mu_b)^2 + (s_a-s_b)^2), RMS). Not KL: the elite std is clamped at
-    --cem_min_std, so KL would mostly measure the std ratio."""
+    --cem_min_std, so KL would mostly measure the std ratio.
+    best_plan is one CEM sample (white noise at --warm_start_init_std around
+    the warm start), so d_exec of two different samples sits at
+    ~sqrt(2)*std whatever the planners prefer. d_avg (RMS over dims of the
+    difference of the K-step mean actions) averages that noise down by
+    sqrt(K); d_mu is d_exec on the final elite means."""
     env_a = lambda x: to_env_actions(x[None], act_mask_1d, real_dim)[0]
-    d2 = (env_a(a) - env_a(b)) ** 2                                   # (H, real_dim)
+    ea, eb = env_a(a), env_a(b)
+    d2 = (ea - eb) ** 2                                               # (H, real_dim)
     out = {"d_exec": float(np.sqrt(d2[:K].mean())), "d_first": float(np.sqrt(d2[0].mean())),
-           "d_H": float(np.sqrt(d2.mean())), "per_step": np.sqrt(d2[:K].mean(axis=1)).tolist()}
+           "d_H": float(np.sqrt(d2.mean())), "per_step": np.sqrt(d2[:K].mean(axis=1)).tolist(),
+           "d_avg": float(np.sqrt(((ea[:K].mean(0) - eb[:K].mean(0)) ** 2).mean()))}
     if mu_std is not None and all("mu" in o for o in mu_std):
         (oa, ob) = mu_std
-        w = (env_a(oa["mu"]) - env_a(ob["mu"])) ** 2 + (env_a(oa["std"]) - env_a(ob["std"])) ** 2
+        dm = (env_a(oa["mu"]) - env_a(ob["mu"])) ** 2
+        w = dm + (env_a(oa["std"]) - env_a(ob["std"])) ** 2
         out["w2"] = float(np.sqrt(w[:K].mean()))
+        out["d_mu"] = float(np.sqrt(dm[:K].mean()))
     return out
 
 
@@ -443,6 +453,8 @@ def run_episode(
     compare = record and bool(args.video_compare)
     # Random actions for the per-replan action-shuffle check (--halluc).
     halluc_gen = torch.Generator(device=device).manual_seed(int(env_seed))
+    # --policy random: uniform actions, reproducible per episode (score floor).
+    random_gen = torch.Generator(device=device).manual_seed(int(env_seed) + 7_919)
 
     def decode(z_seq: torch.Tensor) -> np.ndarray:
         """(T, S, D) packed latents -> (T, 3, H, W) uint8."""
@@ -531,7 +543,8 @@ def run_episode(
         H_plan = min(int(args.horizon), args.max_steps - step)
         K_exec = max(1, min(int(args.replan_every), H_plan))
         bc_only = str(args.policy) == "bc"
-        if bc_only:
+        random_only = str(args.policy) == "random"
+        if bc_only or random_only:
             # Nothing searches over the extra horizon, so only imagine the
             # actions that will actually be executed.
             H_plan = K_exec
@@ -554,6 +567,15 @@ def run_episode(
         if step == 0:
             render_probe("after bc_rollout")
 
+        # u_r of CEM samples: chunked decode + re-encode of every imagined latent.
+        ur_fn = None
+        if str(args.unc_kind).startswith("u_r"):
+            def ur_fn(z_flat: torch.Tensor) -> torch.Tensor:
+                return torch.cat([
+                    roundtrip_residual(encoder, decoder, z_flat[i:i + int(args.ur_chunk)],
+                                       info=info, use_amp=use_amp)
+                    for i in range(0, z_flat.shape[0], int(args.ur_chunk))])
+
         def wm_cem(gen):
             return cem_plan(
                 dyn, z_start=z_ctx,
@@ -571,14 +593,63 @@ def run_episode(
                 discount=float(args.discount),
                 goal_weight=float(args.goal_weight),
                 past_actions=a_ctx, max_ctx=int(args.max_ctx), tau_ctx=float(args.tau_ctx),
+                unc_weight=float(args.unc_weight), log_pop=bool(args.log_cem_pop), log_K=K_exec,
+                unc_kind=str(args.unc_kind), ur_fn=ur_fn,
             )
+
+        def sim_value_score(plans: torch.Tensor, T: int):
+            """--cost reward_value under --compare_sim: the true-model
+            counterpart of value_cost. plans (N, >=T, act_dim) model space,
+            executed for T steps in the simulator. Returns numpy (R_T, V_T, J_T),
+            J_T = R_T + gamma^T V_T, where V_T is the SAME value head on h from
+            the dynamics teacher-forced on the encoded TRUE frames, over the
+            window imagination would attend to at that position (max_ctx past
+            frames + the new one; real context frames fill it when T is short).
+            h_mode "clean" (all slots at full signal): plan-time h is read off
+            the last denoising iteration, so this is the closest deterministic
+            match. A rollout that ends the episode early gets V = 0."""
+            gam = float(args.discount)
+            N = plans.shape[0]
+            W = int(args.max_ctx) + 1 if int(args.max_ctx) > 0 else z_ctx.shape[0] + T
+            n_roll = min(T, W)
+            n_real = min(W - n_roll, z_ctx.shape[0])
+            p16 = torch.zeros((N, T, 16), device=device)
+            p16[..., :act_dim] = plans[:, :T]
+            p16 = p16 * act_mask_1d.view(1, 1, 16)
+            R, frames, n_steps = sim.returns_last_frames(
+                to_env_actions(plans[:, :T], act_mask_1d, real_dim), render_fn, n_roll, discount=gam)
+            V = np.zeros(N)
+            ok = np.flatnonzero(n_steps == T)
+            for s in range(0, len(ok), 32):
+                idx = ok[s:s + 32]
+                fr = torch.from_numpy(np.stack([f for i in idx for f in frames[i]])).float().div(255.0).to(device)
+                z_roll = torch.cat([encode_frames_to_packed(
+                    encoder, fr[c:c + 256], patch=patch, n_spatial=n_spatial,
+                    packing_factor=packing_factor, use_amp=use_amp) for c in range(0, len(fr), 256)])
+                z_roll = z_roll.view(len(idx), n_roll, *z_roll.shape[1:])
+                a_roll = p16[torch.as_tensor(idx, device=device), T - n_roll:]
+                if n_real > 0:
+                    z_roll = torch.cat([z_ctx[-n_real:].unsqueeze(0).expand(len(idx), -1, -1, -1), z_roll], 1)
+                    a_roll = torch.cat([a_ctx[-n_real:].unsqueeze(0).expand(len(idx), -1, -1), a_roll], 1)
+                h = extract_h(dyn, z1=z_roll, actions=a_roll,
+                              act_mask=act_mask_1d.view(1, 1, 16).expand(len(idx), z_roll.shape[1], 16),
+                              lang_emb=None if lang_emb is None else lang_emb.expand(len(idx), -1),
+                              k_max=k_max, mode="clean", use_amp=use_amp)
+                with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
+                    V[idx] = value_head.predict(h)[:, -1].float().cpu().numpy()
+            return R, V, R + gam ** T * V
+
+        sim_score = None
+        if sim is not None and value_head is not None:
+            sim_score = lambda samples: sim_value_score(samples, H_plan)[2]
 
         def sim_cem(gen):
             return sim_cem_plan(
                 sim, horizon=H_plan, act_dim=act_dim, act_mask_1d=act_mask_1d, real_dim=real_dim,
                 n_samples=args.cem_samples, n_elites=args.cem_elites, n_iters=args.cem_iters,
                 init_std=init_std, min_std=args.cem_min_std, noise_beta=args.noise_beta,
-                device=device, generator=gen, init_mu=init_mu, discount=float(args.discount))
+                device=device, generator=gen, init_mu=init_mu, discount=float(args.discount),
+                score_fn=sim_score)
 
         def cmp_gen(k: int) -> torch.Generator:
             # --compare_sim: the same CEM noise draws for both planners at this
@@ -590,6 +661,10 @@ def run_episode(
         if bc_only:
             # Baseline: execute the policy head's own actions, no search.
             out = {"best_plan": init_mu, "best_cost": float("nan"), "history": []}
+        elif random_only:
+            # Floor of the normalized score: uniform actions in [-1, 1].
+            rand_plan = torch.rand((H_plan, act_dim), device=device, generator=random_gen) * 2.0 - 1.0
+            out = {"best_plan": rand_plan, "best_cost": float("nan"), "history": []}
         else:
             out = wm_cem(cmp_gen(0) if sim is not None else rng)
         dt_cem = time.time() - t_cem
@@ -611,14 +686,20 @@ def run_episode(
                                      act_mask_1d, real_dim, mu_std=(out, out_sim)))
             # Planner noise floors: the same planner twice with independent draws.
             n_rep = len(replans)
+            # Extra plans whose true return is logged below: the floor reruns
+            # (regret floor = the planner's own seed-to-seed return spread) and
+            # the BC warm start (what CEM starts from).
+            extra_plans = {"bc": init_mu} if init_mu is not None else {}
             if int(args.sim_floor_every) > 0 and n_rep % int(args.sim_floor_every) == 0:
                 o2 = sim_cem(cmp_gen(1))
                 cmp["floor_sim"] = plan_distance(out_sim["best_plan"], o2["best_plan"], K_exec,
-                                                 act_mask_1d, real_dim)
+                                                 act_mask_1d, real_dim, mu_std=(out_sim, o2))
+                extra_plans["sim2"] = o2["best_plan"]
             if int(args.wm_floor_every) > 0 and n_rep % int(args.wm_floor_every) == 0:
                 o2 = wm_cem(cmp_gen(1))
                 cmp["floor_wm"] = plan_distance(out["best_plan"], o2["best_plan"], K_exec,
-                                                act_mask_1d, real_dim)
+                                                act_mask_1d, real_dim, mu_std=(out, o2))
+                extra_plans["wm2"] = o2["best_plan"]
             if args.exec == "sim":
                 plan = out_sim["best_plan"]
 
@@ -708,35 +789,116 @@ def run_episode(
             dsum = lambda r, n: float(sum(gam ** t * float(v) for t, v in enumerate(list(r)[:n])))
             plans = {"wm": out["best_plan"], "sim": out_sim["best_plan"]}
             env_plans = {k: to_env_actions(v[None], act_mask_1d, real_dim)[0] for k, v in plans.items()}
-            for k, a in env_plans.items():
+            env_extra = {k: to_env_actions(v[None], act_mask_1d, real_dim)[0]
+                         for k, v in extra_plans.items()}
+            for k, a in {**env_plans, **env_extra}.items():
                 cmp[f"Rsim_K_{k}"] = float(sim.returns(a[None, :K_exec], discount=gam)[0])
                 cmp[f"Rsim_H_{k}"] = float(sim.returns(a[None], discount=gam)[0])
+            if value_head is not None:
+                # True-model objective of every logged plan after K and after H
+                # steps: J = R + gamma^t V(true state), V as in sim_value_score.
+                # J_K is what an MPC loop that replans after K steps gets.
+                names = list(plans) + list(extra_plans)
+                stack = torch.stack([{**plans, **extra_plans}[k] for k in names])
+                for tag, T in (("K", K_exec), ("H", H_plan)):
+                    _R, V, J = sim_value_score(stack, T)
+                    for k, v, j in zip(names, V, J):
+                        cmp[f"Vsim_{tag}_{k}"] = float(v)
+                        cmp[f"Jsim_{tag}_{k}"] = float(j)
             ex = str(args.exec)
             other = "sim" if ex == "wm" else "wm"
             if r_hat_seq is not None:                       # executed plan: the diag rollout
                 cmp[f"Rwm_K_{ex}"] = dsum(r_hat_seq.tolist(), K_exec)
                 cmp[f"Rwm_H_{ex}"] = dsum(r_hat_seq.tolist(), H_plan)
+            if value_head is not None and h_pred is not None:
+                with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
+                    v_seq = value_head.predict(h_pred)[0].float()
+                cmp[f"Vwm_K_{ex}"] = float(v_seq[K_exec - 1])
+                cmp[f"Vwm_H_{ex}"] = float(v_seq[H_plan - 1])
             # The other plan: one fresh WM rollout (rewards + its K predicted
             # frames) and the frames the simulator actually produces for it.
             p16 = torch.zeros((1, H_plan, 16), device=device)
             p16[0, :, :act_dim] = plans[other]
             p16 = p16 * act_mask_1d.view(1, 1, 16)
-            z_o, h_o = imagine_batch(
+            z_o, h_o, uf_o, _ = imagine_batch(
                 dyn, z_start=z_ctx.unsqueeze(0), action_plan=p16, horizon=H_plan,
                 sched=sched, k_max=k_max, act_mask_1d=act_mask_1d,
                 lang_emb=lang_emb, use_amp=use_amp, return_h=True,
                 past_actions=a_ctx.unsqueeze(0), max_ctx=int(args.max_ctx), tau_ctx=float(args.tau_ctx),
+                return_unc=True, unc_seeds=1,
             )
+            # u_f of the other plan's WM rollout (free from the sampler); the
+            # executed plan's is unc["u_f"] under --log_unc.
+            cmp[f"uf_{other}"] = _tolist(uf_o[0])
             r_o = predict_rewards(rew_head, h_o, use_amp=use_amp)[0].tolist()
             cmp[f"Rwm_K_{other}"] = dsum(r_o, K_exec)
             cmp[f"Rwm_H_{other}"] = dsum(r_o, H_plan)
+            if value_head is not None:
+                with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
+                    v_seq = value_head.predict(h_o)[0].float()
+                cmp[f"Vwm_K_{other}"] = float(v_seq[K_exec - 1])
+                cmp[f"Vwm_H_{other}"] = float(v_seq[H_plan - 1])
+            for k in ("wm", "sim"):
+                for tag, T in (("K", K_exec), ("H", H_plan)):
+                    if f"Vwm_{tag}_{k}" in cmp and f"Rwm_{tag}_{k}" in cmp:
+                        cmp[f"Jwm_{tag}_{k}"] = cmp[f"Rwm_{tag}_{k}"] + gam ** T * cmp[f"Vwm_{tag}_{k}"]
             wm_o = decode(torch.cat([z_ctx, z_o[0, 1:1 + K_exec]], dim=0))[z_ctx.shape[0]:]
             frames_o, rew_o = sim.rollout_frames(env_plans[other][:K_exec], render_fn)
             cmp[f"hausdorff_{other}"] = [
                 mask_hausdorff(np.transpose(f, (1, 2, 0)), np.transpose(w, (1, 2, 0)), str(args.task))
                 for f, w in zip(frames_o, wm_o)]
+            if int(args.pop_truth) > 0 and "pop_samples" in out:
+                # Ground truth for part of the CEM population: N samples evenly
+                # spaced in u_f rank (all iterations pooled), each replayed in the
+                # simulator (true return, frames) and in one fresh WM rollout
+                # (predicted frames -> Hausdorff, u_f, motion), exactly like the
+                # non-executed plan above. Tests whether u_f ranks plans within a
+                # state and whether every candidate hallucinates.
+                t_pt = time.time()
+                pp = out["pop"]
+                where = [(i, j) for i, d in enumerate(pp["iters"]) for j in range(len(d["uf_H"]))]
+                u_all = np.array([pp["iters"][i]["uf_H"][j] for i, j in where])
+                order = np.argsort(u_all, kind="stable")
+                n_pt = min(int(args.pop_truth), len(order))
+                pick = [where[order[q]] for q in np.unique(np.linspace(0, len(order) - 1, n_pt).round().astype(int))]
+                cand = torch.stack([out["pop_samples"][i][j] for i, j in pick])      # (N, H, act_dim)
+                c16 = torch.zeros((len(pick), H_plan, 16), device=device)
+                c16[:, :, :act_dim] = cand
+                c16 = c16 * act_mask_1d.view(1, 1, 16)
+                z_c, h_c, uf_c, _ = imagine_batch(
+                    dyn, z_start=z_ctx.unsqueeze(0).expand(len(pick), *z_ctx.shape).contiguous(),
+                    action_plan=c16, horizon=H_plan, sched=sched, k_max=k_max,
+                    act_mask_1d=act_mask_1d, lang_emb=lang_emb, use_amp=use_amp, return_h=True,
+                    past_actions=a_ctx.unsqueeze(0).expand(len(pick), *a_ctx.shape).contiguous(),
+                    max_ctx=int(args.max_ctx), tau_ctx=float(args.tau_ctx),
+                    return_unc=True, unc_seeds=1,
+                )
+                r_c = predict_rewards(rew_head, h_c, use_amp=use_amp)              # (N, H)
+                mot_c = (z_c[:, 1:] - z_c[:, :-1]).float().pow(2).flatten(2).mean(2).sqrt()  # (N, H)
+                env_c = to_env_actions(cand, act_mask_1d, real_dim)
+                Rsim_H_c = sim.returns(env_c, discount=gam)
+                pt = []
+                for n, (i, j) in enumerate(pick):
+                    wm_n = decode(torch.cat([z_ctx, z_c[n, 1:1 + K_exec]], dim=0))[z_ctx.shape[0]:]
+                    fr_n, rw_n = sim.rollout_frames(env_c[n, :K_exec], render_fn)
+                    pt.append({
+                        "iter": int(i), "idx": int(j),
+                        "cost": float(pp["iters"][i]["cost"][j]), "uf_H_pop": float(pp["iters"][i]["uf_H"][j]),
+                        "elite": int(pp["iters"][i]["elite"][j]),
+                        "chosen": int((i, j) == (pp["chosen_iter"], pp["chosen_idx"])),
+                        "uf": _tolist(uf_c[n]), "motion": _tolist(mot_c[n]),
+                        "Rwm_K": dsum(r_c[n].tolist(), K_exec), "Rwm_H": dsum(r_c[n].tolist(), H_plan),
+                        "Rsim_K": dsum(rw_n, K_exec), "Rsim_H": float(Rsim_H_c[n]),
+                        "hausdorff": [mask_hausdorff(np.transpose(f, (1, 2, 0)), np.transpose(w, (1, 2, 0)),
+                                                     str(args.task)) for f, w in zip(fr_n, wm_n)],
+                    })
+                cmp["pop_truth"] = pt
+                cmp["pop_truth_seconds"] = time.time() - t_pt
             cmp["regret_K"] = cmp["Rsim_K_sim"] - cmp["Rsim_K_wm"]
             cmp["regret_H"] = cmp["Rsim_H_sim"] - cmp["Rsim_H_wm"]
+            if "Jsim_K_sim" in cmp:
+                cmp["regret_J_K"] = cmp["Jsim_K_sim"] - cmp["Jsim_K_wm"]
+                cmp["regret_J_H"] = cmp["Jsim_H_sim"] - cmp["Jsim_H_wm"]
 
         r_chunk = 0.0
         n_hist_before = len(z_hist)
@@ -850,10 +1012,13 @@ def run_episode(
             **({"unc": unc} if unc is not None else {}),
             **({"halluc": halluc} if halluc is not None else {}),
             **({"compare": cmp} if cmp is not None else {}),
+            **({"cem_pop": out["pop"]} if "pop" in out else {}),
+            **({"unc_lam": out["unc_lam"], "best_obj": out["best_obj"]} if "unc_lam" in out else {}),
         })
         # cost = -pred_return + goal_term, so the two terms show which one the
         # planner is actually optimizing. Under --policy bc there is no CEM cost.
-        cost_str = ("cost=  (bc)  " if bc_only else f"cost={out['best_cost']:+.3f}")
+        cost_str = (f"cost=  ({args.policy})  " if (bc_only or random_only)
+                    else f"cost={out['best_cost']:+.3f}")
         term_str = (f"value {value_term:+.2f}" if value_head is not None
                     else f"goal {goal_term:+.2f} (d={goal_dist:.3f})")
         print(f"  [ep {ep_index} step {step:4d}] {cost_str} "
@@ -868,6 +1033,20 @@ def run_episode(
                   f"| Rsim_K wm {cmp['Rsim_K_wm']:.2f} sim {cmp['Rsim_K_sim']:.2f} (regret {cmp['regret_K']:+.2f}) "
                   f"| Rwm_K wm {cmp.get('Rwm_K_wm', float('nan')):.2f} sim {cmp.get('Rwm_K_sim', float('nan')):.2f} "
                   f"| HD wm {hd['wm']:.1f} sim {hd['sim']:.1f} | sim {cmp['sim_seconds']:.1f}s", flush=True)
+            if "pop_truth" in cmp:
+                hd_pt = [_nanmean(c["hausdorff"]) for c in cmp["pop_truth"]]
+                print(f"      pop_truth: {len(hd_pt)} plans HD {np.min(hd_pt):.1f}-{np.max(hd_pt):.1f} "
+                      f"| Rsim_K {min(c['Rsim_K'] for c in cmp['pop_truth']):.2f}-"
+                      f"{max(c['Rsim_K'] for c in cmp['pop_truth']):.2f} "
+                      f"| {cmp['pop_truth_seconds']:.1f}s", flush=True)
+        if "pop" in out:
+            pp = out["pop"]
+            ku = {"u_f": "uf_H", "u_r": "ur_H", "u_f_norm": "ufn_H", "u_r_norm": "urn_H"}[pp["unc_kind"]]
+            u_all = [u for d in pp["iters"] for u in d[ku]]
+            u_ch = pp["iters"][pp["chosen_iter"]][ku][pp["chosen_idx"]]
+            print(f"      cem_pop: lam {pp['lam']:.3g} | {pp['unc_kind']}(H) chosen {u_ch:.4f} "
+                  f"pop mean {np.mean(u_all):.4f} (chosen pct {100 * np.mean(np.array(u_all) < u_ch):.0f})",
+                  flush=True)
         if unc is not None:
             print(f"      unc: u_r {_nanmean(unc['u_r']):.4f} u_f {_nanmean(unc['u_f']):.4f} "
                   f"u_s {_nanmean(unc['u_s']):.4f} motion {_nanmean(unc['motion']):.4f} "
@@ -883,7 +1062,7 @@ def run_episode(
         "mean_reward": float(np.mean(rewards)) if rewards else float("nan"),
         "success": float(success),
         "cost_kind": str(args.cost),
-        "bc_head": ("categorical:" + str(args.bc_readout)) if str(args.policy_ckpt) else "released",
+        "bc_head": (f"{args.bc_head_type}:" + str(args.bc_readout)) if str(args.policy_ckpt) else "released",
         "goal_weight": float(args.goal_weight),
         "horizon": int(args.horizon),
         "replan_every": int(args.replan_every),
@@ -895,6 +1074,8 @@ def run_episode(
         "max_ctx": int(args.max_ctx),
         "tau_ctx": float(args.tau_ctx),
         "eval_d": float(args.eval_d),
+        "unc_weight": float(args.unc_weight),
+        "unc_kind": str(args.unc_kind),
         "env_seed": int(env_seed),
         "n_replans": len(replans),
         "pred_return_mean": _nanmean([r["pred_return"] for r in replans]),
@@ -1010,7 +1191,8 @@ def evaluate(args):
             load_policy_head_from_ckpt(args.policy_ckpt, device),
             readout=str(args.bc_readout),
         ).to(device).eval().requires_grad_(False)
-        print(f"[mpc] loaded categorical BC head from {args.policy_ckpt} "
+        args.bc_head_type = policy_head.head.policy_type
+        print(f"[mpc] loaded {args.bc_head_type} BC head from {args.policy_ckpt} "
               f"(readout={args.bc_readout})")
 
     value_head = None
@@ -1058,9 +1240,9 @@ def evaluate(args):
         env = EnvCollector(args.task, img_size=int(info["H"]), action_dim=16, seed=env_seed)
         args.max_steps = max_steps_arg if max_steps_arg > 0 else int(env._max_episode_steps or 500)
         if ep_index == 0:
-            head = (f"policy=bc (no search), K={args.replan_every}" if args.policy == "bc"
+            head = (f"policy={args.policy} (no search), K={args.replan_every}" if args.policy != "cem"
                     else f"policy=cem cost={args.cost} H={args.horizon} K={args.replan_every}")
-            head += (f" bc_head=categorical({args.bc_readout})" if str(args.policy_ckpt)
+            head += (f" bc_head={args.bc_head_type}({args.bc_readout})" if str(args.policy_ckpt)
                      else " bc_head=released(deterministic)")
             print(f"[mpc] task={args.task} act_dim={act_dim} real_act_dim={env._real_action_dim} "
                   f"max_steps={args.max_steps} {head}")
@@ -1116,13 +1298,13 @@ def main():
     p.add_argument("--tokenizer_ckpt", type=str, default="./checkpoints/combined/tokenizer.pt")
     p.add_argument("--dynamics_ckpt", type=str, default="./checkpoints/combined/dynamics.pt")
     p.add_argument("--policy_ckpt", type=str, default="",
-                   help="categorical BC head from train_heads_offline.py, used in "
+                   help="stochastic (categorical or Gaussian) BC head from train_heads_offline.py, used in "
                         "place of the deterministic one in dynamics.pt. Drives both "
                         "--policy bc and the --warm_start bc CEM init.")
     p.add_argument("--bc_readout", type=str, default="sample",
                    choices=["sample", "mean", "argmax"],
-                   help="(--policy_ckpt) how to collapse the per-dim bin "
-                        "distribution into an action. 'sample' is the default for a "
+                   help="(--policy_ckpt) how to collapse the per-dim action "
+                        "distribution into an action (Gaussian: mean == argmax). 'sample' is the default for a "
                         "reason: on cup-catch the sampled readout scored ~0.47 "
                         "closed-loop against ~0.10 -- the random floor -- for both "
                         "mean and argmax. Use the deterministic readouts for "
@@ -1149,14 +1331,15 @@ def main():
     p.add_argument("--discount", type=float, default=1.0)
 
     # MPC (defaults follow the paper's collection setting)
-    p.add_argument("--policy", type=str, default="cem", choices=["cem", "bc"],
+    p.add_argument("--policy", type=str, default="cem", choices=["cem", "bc", "random"],
                    help="'cem' searches over action sequences with the world model. "
                         "'bc' skips the search and executes the policy head's own "
                         "actions — the baseline CEM is warm-started from. Use "
                         "--replan_every 1 for true closed-loop BC (each action "
                         "conditioned on the real frame); larger K executes actions "
                         "generated inside the model's imagination. Run dirs get a "
-                        "_bc suffix")
+                        "_bc suffix. 'random' executes uniform actions (the floor "
+                        "of the normalized score); use it with --warm_start none")
     p.add_argument("--horizon", type=int, default=32, help="plan horizon H")
     p.add_argument("--replan_every", type=int, default=16, help="actions executed per plan (K)")
     p.add_argument("--ctx_frames", type=int, default=4,
@@ -1243,12 +1426,36 @@ def main():
                    help="denoising seeds per imagined step for u_s under --log_unc "
                         "(the paper's inter-seed variance; needs >= 2)")
 
+    # uncertainty-aware CEM (plan_cem.cem_plan)
+    p.add_argument("--unc_weight", type=float, default=0.0,
+                   help="WM CEM selects elites / the plan by cost + lam * u_f (u_f = flow "
+                        "instability averaged over the H steps), lam = c * std(cost)/std(u_f) "
+                        "of the iteration-0 population. c = this value; 0 = unchanged planner")
+    p.add_argument("--unc_kind", type=str, default="u_f", choices=["u_f", "u_r", "u_f_norm", "u_r_norm"],
+                   help="predictor penalized by --unc_weight. u_r = tokenizer round-trip "
+                        "residual of every imagined step of every CEM sample (~+26%% planner "
+                        "time); *_norm = per-step u / rollout motion, then averaged; with u_r or "
+                        "u_r_norm, --log_cem_pop logs u_f, u_r and both normalized versions")
+    p.add_argument("--ur_chunk", type=int, default=256, help="latents per decode/encode call for u_r")
+    p.add_argument("--log_cem_pop", action="store_true",
+                   help="log every CEM sample's cost, u_f and rollout motion (first K steps and "
+                        "all H), elite flags and the chosen sample into each replan (cem_pop)")
+    p.add_argument("--pop_truth", type=int, default=0,
+                   help="--compare_sim + --log_cem_pop: per replan, replay N CEM samples (evenly "
+                        "spaced in u_f rank over all iterations) in the simulator and in a fresh WM "
+                        "rollout; logs their true return, Hausdorff per executed step and u_f into "
+                        "compare.pop_truth. 0 = off")
+
     args = p.parse_args()
+    if args.pop_truth > 0 and not (args.compare_sim and args.log_cem_pop):
+        p.error("--pop_truth needs --compare_sim and --log_cem_pop")
     if args.compare_sim:
         # Same objective on both sides: the reward head vs the true reward. Goal
         # / value terms have no simulator counterpart.
-        if args.policy != "cem" or args.cost != "reward":
-            p.error("--compare_sim needs --policy cem --cost reward")
+        # reward_value: the simulator side adds the same value head on h
+        # teacher-forced from the true frames (sim_value_score).
+        if args.policy != "cem" or args.cost not in ("reward", "reward_value"):
+            p.error("--compare_sim needs --policy cem --cost reward|reward_value")
         if not (args.halluc and args.video_compare and args.video != "none"):
             p.error("--compare_sim needs the compare video path (--halluc, --video_compare) for the "
                     "per-step hallucination labels")

@@ -7,7 +7,7 @@ lambda-returns. Fitting it on data first gives (a) a value head the CEM planner
 can use immediately as a terminal value -- replacing the latent-distance
 stand-in `plan_cem.py` flags as a substitute "for the value of the final
 imagined state (there is no value head)" -- and (b) a warm start for phase 3,
-which matters because with gamma=0.997 (effective horizon ~333 steps) and a
+which matters because with gamma=0.99 (effective horizon ~100 steps) and a
 short imagination horizon, the bootstrap carries nearly all the signal.
 
 Nothing existing is modified: the tokenizer, dynamics, reward head and BC head
@@ -34,7 +34,7 @@ import torch.nn.functional as F
 import wandb
 from torch.utils.data import DataLoader
 
-from heads_rl import CategoricalPolicyHeadMTP, ValueHeadMTP
+from heads_rl import ValueHeadMTP, build_policy_head
 from interactive import load_dynamics_from_ckpt, load_tokenizer_from_ckpt
 from model import pack_bottleneck_to_spatial, temporal_patchify
 from rl_algorithms import GAMMA, LAMBDA, compute_lambda_returns, value_loss
@@ -149,8 +149,8 @@ def value_targets(value_head, h: torch.Tensor, rewards: torch.Tensor,
     the horizon is H = T-1 and v_{T-1} is the bootstrap.
 
     Monte-Carlo returns-to-go are NOT an option here: cup-catch episodes end by
-    500-step time limit, not termination, and gamma=0.997 has a longer effective
-    horizon than the episode, so truncation bias would contaminate every slot.
+    500-step time limit, not termination, so the bootstrap at the episode end
+    is needed (truncation, not a terminal state), so truncation bias would contaminate every slot.
     Bootstrapping is what makes the target well-posed.
     """
     T = h.shape[1]
@@ -184,20 +184,25 @@ def mc_returns_per_frame(ep: torch.Tensor, rew: torch.Tensor, gamma: float,
     obs[j-1] -> obs[j], so from frame i with episode last frame b:
         G[i] = sum_{j=i+1..b} gamma^(j-i-1) * rew[j]
 
-    Episodes end by time limit (~500 steps), while gamma=0.997 has a longer
-    horizon than that, so the truncated G undershoots the infinite-horizon value
-    the head is trained toward (the missing tail weighs gamma^(b-i), ~0.22 at the
-    start of a 500-step episode). `G_tail` adds that tail assuming the reward
+    Episodes end by time limit, not termination, so the truncated G undershoots
+    the infinite-horizon value the head is trained toward (the missing tail
+    weighs gamma^(b-i): at gamma=0.99, ~0.007 at the start of a 500-step episode,
+    ~0.37 at the start of a 100-step Meta-World episode). `G_tail` adds that tail assuming the reward
     stays at its mean over the episode's last `tail_steps` transitions:
         G_tail[i] = G[i] + gamma^(b-i) * rbar_tail / (1 - gamma)
     This is an approximation (fine for tasks that settle, e.g. reacher/cup-catch
     holding the goal), which is why the truncated error is logged too.
+
+    Also returns `to_end[i] = b - i`, the steps left in the episode: the tail
+    term weighs gamma^(b-i), so frames far from the end have a target made
+    almost entirely of observed rewards.
     """
     ep = ep.cpu().numpy()
     r = torch.nan_to_num(rew.float(), nan=0.0).cpu().double().numpy()
     N = r.shape[0]
     G = torch.zeros(N, dtype=torch.float64).numpy()
     G_tail = torch.zeros(N, dtype=torch.float64).numpy()
+    to_end = torch.zeros(N, dtype=torch.long).numpy()
     bounds = [0] + [i for i in range(1, N) if ep[i] != ep[i - 1]] + [N]
     for a, e in zip(bounds[:-1], bounds[1:]):
         b = e - 1                                   # last frame of this episode
@@ -209,7 +214,9 @@ def mc_returns_per_frame(ep: torch.Tensor, rew: torch.Tensor, gamma: float,
         rbar = float(r[b - n_tail + 1:b + 1].mean()) if b > a else 0.0
         for i in range(a, b + 1):
             G_tail[i] = G[i] + gamma ** (b - i) * rbar / (1.0 - gamma)
-    return torch.from_numpy(G).float(), torch.from_numpy(G_tail).float()
+            to_end[i] = b - i
+    return (torch.from_numpy(G).float(), torch.from_numpy(G_tail).float(),
+            torch.from_numpy(to_end))
 
 
 class MCWindows(torch.utils.data.Dataset):
@@ -217,20 +224,24 @@ class MCWindows(torch.utils.data.Dataset):
     per-slot ground-truth returns `mc_ret` / `mc_ret_tail` (T,).
 
     Evenly spaced rather than the first N: the val loader's first N windows at
-    stride 1 all come from a single episode.
+    stride 1 all come from a single episode. `idx` overrides the spacing with
+    explicit dataset indices.
     """
 
-    def __init__(self, ds: WMDataset, n_windows: int, gamma: float, tail_steps: int = 50):
+    def __init__(self, ds: WMDataset, n_windows: int, gamma: float, tail_steps: int = 50,
+                 idx: Optional[list] = None):
         n = len(ds)
         k = max(1, min(int(n_windows), n))
         self.ds = ds
         self.T = ds.T
-        self.idx = torch.linspace(0, n - 1, k).round().long().unique().tolist()
-        self.G, self.G_tail = [], []
+        self.idx = (list(idx) if idx is not None
+                    else torch.linspace(0, n - 1, k).round().long().unique().tolist())
+        self.G, self.G_tail, self.to_end = [], [], []
         for ti in range(len(ds.tasks)):
-            g, gt = mc_returns_per_frame(ds.ep[ti], ds.rew[ti], gamma, tail_steps)
+            g, gt, te = mc_returns_per_frame(ds.ep[ti], ds.rew[ti], gamma, tail_steps)
             self.G.append(g)
             self.G_tail.append(gt)
+            self.to_end.append(te)
 
     def __len__(self):
         return len(self.idx)
@@ -242,6 +253,7 @@ class MCWindows(torch.utils.data.Dataset):
         # slot t of the window is obs[start + t] (parse_batch drops obs[T])
         item["mc_ret"] = self.G[ti][start:start + self.T]
         item["mc_ret_tail"] = self.G_tail[ti][start:start + self.T]
+        item["mc_to_end"] = self.to_end[ti][start:start + self.T]
         return item
 
 
@@ -297,8 +309,15 @@ def main():
                         "no temporal context (slot 0 sees one frame, so no velocity)")
     p.add_argument("--h_mode", type=str, default="train", choices=["train", "clean"])
     p.add_argument("--value_num_bins", type=int, default=255)
-    p.add_argument("--policy_num_bins", type=int, default=41)
-    p.add_argument("--bc_L", type=int, default=8, help="match the released head's MTP length")
+    p.add_argument("--policy_type", type=str, default="categorical",
+                   choices=["categorical", "gaussian"],
+                   help="stochastic BC head: per-dim 41-bin categorical (Dreamer 4 paper) "
+                        "or diagonal Gaussian (standard continuous control, as dreamer_v4 PolicyHead)")
+    p.add_argument("--policy_num_bins", type=int, default=41, help="categorical head only")
+    p.add_argument("--bc_L", type=int, default=8,
+                   help="actions predicted per slot. 1 = plain next-action BC (dreamer_v4 "
+                        "phase 3); 8 = the released head's MTP, which in dreamer_v4 only "
+                        "shapes the dynamics in phase 2 -- with a frozen WM it adds nothing")
     p.add_argument("--bc_act_dim", type=int, default=16,
                    help="action dims the BC head outputs; set to the task's act_dim "
                         "(cup-catch 2, mw-* 4) to drop the zero-padded ones")
@@ -312,10 +331,9 @@ def main():
     p.add_argument("--no_amp", action="store_true")
     p.add_argument("--log_every", type=int, default=25)
     p.add_argument("--val_every", type=int, default=250)
-    p.add_argument("--val_batches", type=int, default=20)
-    p.add_argument("--mc_windows", type=int, default=320,
-                   help="value head: evenly spaced val windows scored against real "
-                        "discounted returns-to-go at every validation (0 = off)")
+    p.add_argument("--val_windows", type=int, default=320,
+                   help="val windows evenly spaced over all val episodes (the val "
+                        "loader at stride 1 would give only episode 0); 0 = no val")
     p.add_argument("--mc_tail_steps", type=int, default=50,
                    help="transitions at episode end whose mean reward extrapolates "
                         "the return past the time limit (see mc_returns_per_frame)")
@@ -371,16 +389,15 @@ def main():
         params += list(head.parameters())
         print(f"[head] ValueHeadMTP params={sum(p_.numel() for p_ in head.parameters())/1e6:.2f}M")
     if want_policy:
-        pol = CategoricalPolicyHeadMTP(
+        pol = build_policy_head(
+            args.policy_type,
             d_model=d_model, L=args.bc_L, act_dim_max=args.bc_act_dim,
             num_bins=args.policy_num_bins,
             mlp_ratio=args.head_mlp_ratio, dropout=args.head_dropout,
             pool_agent=args.head_pool,
         ).to(device)
         params += list(pol.parameters())
-        print(f"[head] CategoricalPolicyHeadMTP params={sum(p_.numel() for p_ in pol.parameters())/1e6:.2f}M")
-        if policy_head is None:
-            print("[bc] released deterministic head absent -- agreement check disabled.")
+        print(f"[head] {type(pol).__name__} params={sum(p_.numel() for p_ in pol.parameters())/1e6:.2f}M")
     if not params:
         raise SystemExit(f"--head={args.head!r} selected no trainable head.")
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
@@ -414,36 +431,34 @@ def main():
           f"{sum(p_.numel() for p_ in params)/1e6:.2f}M trainable "
           f"({100*sum(p_.numel() for p_ in params)/(n_frozen+sum(p_.numel() for p_ in params)):.1f}%)")
 
-    def save(path, best_bc=False, best_value=False):
+    def save(path):
         blob = {"args": vars(args), "d_model": d_model, "step": step, "epoch": epoch}
         if head is not None:
             blob["value_head"] = head.state_dict()
             blob["num_bins"] = args.value_num_bins
         if pol is not None:
             blob["policy_head"] = pol.state_dict()
+            blob["policy_type"] = args.policy_type
             blob["policy_num_bins"] = args.policy_num_bins
             blob["bc_L"] = args.bc_L
             blob["act_dim_max"] = args.bc_act_dim
-        blob["best_bc"] = bool(best_bc)
-        blob["best_value"] = bool(best_value)
         torch.save(blob, path)
 
     # --- data ---------------------------------------------------------------
     _, loader = build_loader(args, args.data_dirs, args.frame_dirs, shuffle=True)
-    val_ds = val_loader = mc_loader = None
-    if args.val_data_dirs and os.path.isdir(str(args.val_data_dirs[0])):
+    val_loader = None
+    if args.val_windows > 0 and args.val_data_dirs and os.path.isdir(str(args.val_data_dirs[0])):
         try:
-            val_ds, val_loader = build_loader(args, args.val_data_dirs, args.val_frame_dirs, shuffle=False)
+            val_ds, _ = build_loader(args, args.val_data_dirs, args.val_frame_dirs, shuffle=False)
         except Exception as e:  # a partition without this task is not fatal
             print(f"[val] disabled: {e}")
-    if head is not None and val_ds is not None and args.mc_windows > 0:
-        mc_ds = MCWindows(val_ds, args.mc_windows, args.gamma, args.mc_tail_steps)
-        mc_loader = DataLoader(
-            mc_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
-            collate_fn=collate_batch, drop_last=False, pin_memory=True,
-        )
-        print(f"[mc] {len(mc_ds)} val windows, evenly spaced over {len(val_ds)} "
-              f"(gamma={args.gamma}, tail_steps={args.mc_tail_steps})")
+        else:
+            mc_ds = MCWindows(val_ds, args.val_windows, args.gamma, args.mc_tail_steps)
+            val_loader = DataLoader(
+                mc_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
+                collate_fn=collate_batch, pin_memory=True)
+            print(f"[val] {len(mc_ds)} val windows, evenly spaced over {len(val_ds)} "
+                  f"(gamma={args.gamma}, tail_steps={args.mc_tail_steps})")
 
     def get_h(batch):
         frames, actions, act_mask, rewards, lang_emb = parse_batch(
@@ -472,34 +487,24 @@ def main():
                 mask[:, :min(args.warmup_slots, H)] = 0.0
             l_v = value_loss(head, h[:, :H], returns, mask=mask)
             loss = loss + l_v
-            m = mask.bool()
-            stats.update(
-                ce=float(l_v.detach()),
-                V=float(values[:, :H][m].mean()),
-                R=float(returns[m].mean()),
-                mae=float((values[:, :H] - returns).abs()[m].mean()),
-            )
+            stats["value_ce"] = float(l_v.detach())
 
         if pol is not None:
             tgt, full_mask = bc_targets(actions, act_mask, args.bc_L)
             l_bc = pol.bc_loss(h, tgt, full_mask)
             loss = loss + l_bc
-            stats["nll"] = float(l_bc.detach())
             with torch.no_grad():
-                stats["astd"] = float(pol.action_std(h))
-                # Pipeline check: the categorical head's mean action should
-                # track the released deterministic head on the same h_t and the
-                # same l=0 target. A large gap means h_t extraction or the MTP
-                # shift is wrong, not that the head is undertrained -- it is the
-                # only correctness signal available without a closed-loop eval.
-                if policy_head is not None:
-                    A = pol.act_dim_max
-                    ref = policy_head(h.detach())[:, :, 0, :A]        # (B,T,A) tanh means
-                    mine = pol.mean(h)                                # (B,T,A)
-                    dm = full_mask[:, :, 0, :A]                       # (B,T,A)
-                    stats["agree"] = float(
-                        (((mine - ref) ** 2) * dm).sum() / dm.sum().clamp_min(1.0)
-                    )
+                # Next action only (l=0), the offset PMPO and the planner use; equal
+                # to the training loss when bc_L=1. NLL is per valid action dim.
+                # mse is the mean action vs the real next action, comparable
+                # across categorical and Gaussian heads, unlike the NLL.
+                tgt0, m0 = tgt[:, :, 0], full_mask[:, :, 0]           # (B,T,16)
+                lp0 = pol.log_prob(h, tgt0, act_mask=m0)              # (B,T)
+                stats["bc_nll"] = float(-lp0.sum() / m0.sum().clamp_min(1.0))
+                A0 = pol.act_dim_max
+                m0a = m0[..., :A0].float()
+                stats["bc_mse"] = float(
+                    (((pol.mean(h) - tgt0[..., :A0]) ** 2) * m0a).sum() / m0a.sum().clamp_min(1.0))
 
         if train:
             opt.zero_grad(set_to_none=True)
@@ -508,7 +513,7 @@ def main():
             opt.step()
 
         stats["loss"] = float(loss.detach())
-        return stats
+        return stats, h
 
     wandb.init(
         project=args.wandb_project,
@@ -530,72 +535,54 @@ def main():
     trainables = [m for m in (head, pol) if m is not None]
 
     def _fmt(s):
-        order = ("loss", "ce", "V", "R", "mae", "nll", "agree", "astd")
-        return " ".join(f"{k}={s[k]:.4g}" for k in order if k in s)
+        return " ".join(f"{k}={v:.4g}" for k, v in s.items())
 
     @torch.no_grad()
     def validate():
+        """BC metrics averaged over the val windows, plus the value head against
+        real discounted returns-to-go (tail-corrected, see mc_returns_per_frame)
+        over its trained slots [warmup_slots, T-1). The value loss itself only
+        measures agreement with self-bootstrapped targets, so it is not logged
+        on val."""
         for m in trainables:
             m.eval()
-        acc, n = {}, 0
-        for i, b in enumerate(val_loader):
-            if i >= args.val_batches:
-                break
-            s = run_batch(b, train=False)
+        acc, n, V, G = {}, 0, [], []
+        for b in val_loader:
+            s, h = run_batch(b, train=False)
+            s.pop("value_ce", None)
+            s.pop("loss", None)
             for k, v in s.items():
                 acc[k] = acc.get(k, 0.0) + v
             n += 1
+            if head is not None:
+                sl = slice(args.warmup_slots, h.shape[1] - 1)
+                V.append(head.predict(h)[:, sl].flatten().float().cpu())
+                G.append(b["mc_ret_tail"][:, sl].flatten())
         for m in trainables:
             m.train()
-        return {k: v / max(n, 1) for k, v in acc.items()}
-
-    @torch.no_grad()
-    def mc_validate():
-        """V(h_t) vs real discounted returns-to-go, over the value-trained slots
-        [warmup_slots, T-1). mc_* use the tail-corrected return; mc_mae_trunc the
-        plain truncated one. mc_corr is what matters most for ranking in CEM."""
-        head.eval()
-        V, G, Gt = [], [], []
-        for b in mc_loader:
-            h = get_h(b)[0]
-            sl = slice(args.warmup_slots, h.shape[1] - 1)
-            V.append(head.predict(h)[:, sl].flatten().float().cpu())
-            G.append(b["mc_ret"][:, sl].flatten())
-            Gt.append(b["mc_ret_tail"][:, sl].flatten())
-        head.train()
-        V, G, Gt = torch.cat(V), torch.cat(G), torch.cat(Gt)
-        corr = torch.corrcoef(torch.stack([V, Gt]))[0, 1]
-        return {
-            "mc_mae": float((V - Gt).abs().mean()),
-            "mc_bias": float((V - Gt).mean()),
-            "mc_corr": float(torch.nan_to_num(corr, nan=0.0)),
-            "mc_mae_trunc": float((V - G).abs().mean()),
-            "mc_V": float(V.mean()),
-            "mc_G": float(Gt.mean()),
-        }
+        out = {k: v / max(n, 1) for k, v in acc.items()}
+        if V:
+            V, G = torch.cat(V), torch.cat(G)
+            out.update(
+                value_mae=float((V - G).abs().mean()),
+                value_bias=float((V - G).mean()),
+                value_corr=float(torch.nan_to_num(torch.corrcoef(torch.stack([V, G]))[0, 1], nan=0.0)),
+            )
+        return out
 
     # --- loop ---------------------------------------------------------------
-    # The two heads converge on very different timescales: BC is a dense
-    # supervised map that tends to bottom out within a few epochs and then
-    # overfit, while the value head needs enough passes for the window-edge
-    # bootstrap to propagate (~333/seq_len epochs at gamma=0.997). Rather than
-    # scheduling them separately, keep a best-by-val-NLL BC snapshot so the
-    # policy head is not hostage to the value head's longer run.
+    # The value head needs enough passes for the window-edge bootstrap to
+    # propagate (~100/seq_len epochs at gamma=0.99); BC converges much sooner.
+    # Every epoch is kept, so pick the checkpoint afterwards (closed-loop eval).
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     out_stem = os.path.splitext(args.out)[0]
-    best_path = out_stem + "_bc_best.pt"
-    best_nll = float("inf")
-    # Value snapshot selected by the MC check, which measures accuracy against
-    # real returns (the value ce/mae only measure self-consistency).
-    best_value_path = out_stem + "_value_best.pt"
-    best_mc = float("inf")
     for m in trainables:
         m.train()
 
     step, epoch, t0 = 0, 0, time.time()
     for epoch in range(args.epochs):
         for batch in loader:
-            s = run_batch(batch, train=True)
+            s, _ = run_batch(batch, train=True)
             step += 1
             if step % args.log_every == 0:
                 print(f"[{epoch}:{step}] {_fmt(s)} ({step/(time.time()-t0):.2f} it/s)")
@@ -606,35 +593,17 @@ def main():
                 v = validate()
                 print(f"[{epoch}:{step}] VAL {_fmt(v)}")
                 wandb.log({f"val/{k}": x for k, x in v.items()}, step=step)
-                if pol is not None and "nll" in v and v["nll"] < best_nll:
-                    best_nll = v["nll"]
-                    save(best_path, best_bc=True)
-                    wandb.log({"val/best_nll": best_nll}, step=step)
-                    print(f"[ckpt] new best BC val nll={best_nll:.4f} -> {best_path}")
-                if mc_loader is not None:
-                    mc = mc_validate()
-                    print(f"[{epoch}:{step}] MC  " + " ".join(f"{k}={x:.4g}" for k, x in mc.items()))
-                    wandb.log({f"val/{k}": x for k, x in mc.items()}, step=step)
-                    if mc["mc_mae"] < best_mc:
-                        best_mc = mc["mc_mae"]
-                        save(best_value_path, best_value=True)
-                        wandb.log({"val/best_mc_mae": best_mc}, step=step)
-                        print(f"[ckpt] new best value mc_mae={best_mc:.4g} -> {best_value_path}")
             if args.max_steps and step >= args.max_steps:
                 break
         if args.max_steps and step >= args.max_steps:
             break
         save(args.out)
-        # Keep every epoch as well: the latest-only file above made it impossible
-        # to go back to an earlier value head after seeing closed-loop results.
         ep_path = f"{out_stem}_ep{epoch:02d}.pt"
         save(ep_path)
         print(f"[ckpt] epoch {epoch} -> {args.out} (+ {ep_path})")
 
     save(args.out)
-    print(f"[done] {step} steps -> {args.out}"
-          + (f" (best BC: {best_path}, nll={best_nll:.4f})" if best_nll < float("inf") else "")
-          + (f" (best value: {best_value_path}, mc_mae={best_mc:.4g})" if best_mc < float("inf") else ""))
+    print(f"[done] {step} steps -> {args.out}")
     wandb.finish()
 
 

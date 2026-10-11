@@ -20,8 +20,11 @@ import torch.nn as nn
 
 from model import dist_cross_entropy_from_symlog, symlog
 
-# Paper defaults (section "Imagination training").
-GAMMA = 0.997
+# Paper defaults (section "Imagination training"), except GAMMA: the paper's 0.997
+# (~333-step horizon) is far longer than our 24-step offline windows and than
+# 100-step Meta-World episodes, so the targets were almost pure self-bootstrap.
+# 0.99 (~100 steps) keeps most of the target in real rewards.
+GAMMA = 0.99
 LAMBDA = 0.95
 PMPO_ALPHA = 0.5
 PMPO_BETA = 0.3
@@ -51,7 +54,7 @@ def compute_lambda_returns(
     c_t gates exactly the future beyond r_t. On tasks that never terminate
     (e.g. cup-catch, a 500-step time limit) c_t = 1 everywhere is exact, not an
     approximation -- but the bootstrap at the window edge is then load-bearing,
-    since gamma=0.997 has an effective horizon far longer than any window.
+    since even gamma=0.99 has an effective horizon (~100 steps) longer than any window.
 
     Returns (B, H).
     """

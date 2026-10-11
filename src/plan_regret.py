@@ -10,6 +10,25 @@ Per replan (K = executed steps, H = horizon), from replans[i].compare:
     d_exec, d_first, w2   action distance a_wm vs a_sim (env action space)
     floor_sim / floor_wm  the same planner twice with independent noise: the
                           distance expected from CEM's own randomness
+    d_avg, d_mu (+ _floor_sim)  distance of the K-step mean actions / of the
+                          final elite means. d_exec compares two single CEM
+                          samples, so it sits at the white-noise level
+                          ~sqrt(2)*warm_start_init_std; these average it out
+    regret_floor_K        R_sim(a_sim) - R_sim(a_sim2), a_sim2 = the sim floor
+                          rerun: return spread of the true-model CEM itself
+    regret_bc_K           R_sim(a_sim) - R_sim(a_bc), a_bc = the BC warm start
+  --cost reward_value runs (both planners add the same value head; the sim side
+  on h teacher-forced from the true frames):
+    regret_J_K / _H       J_sim(a_sim) - J_sim(a_wm), J = R + gamma^t V(true
+                          state) after t = K / H steps. regret_J_H is the main
+                          regret for these runs (replaces regret_K below): J_H
+                          is the objective the sim CEM maximizes, so J_K can be
+                          negative (a_sim is not optimized for it, and V moves
+                          by tens along a trajectory)
+    regret_J_floor_H, regret_J_bc_H (and _K)   as above, on J
+    v_optimism_K          V_wm(a_wm) - V_sim(a_wm) at K: value over-estimate
+                          from the WM's imagined state vs the true one
+    optimism_J_K          J_wm(a_wm) - J_sim(a_wm)
     regret_K / regret_H   R_sim(a_sim) - R_sim(a_wm): true return lost by
                           following the WM plan
     optimism_K            R_wm(a_wm) - R_sim(a_wm): the WM's over-prediction of
@@ -55,11 +74,26 @@ def replan_rows(json_path, run):
                "ep_return": ep["return"]}
         for k in ("d_exec", "d_first", "d_H", "w2", "regret_K", "regret_H", "sim_seconds"):
             row[k] = c.get(k, np.nan)
+        for k in ("d_avg", "d_mu"):
+            row[k] = c.get(k, np.nan)
         for f in ("floor_sim", "floor_wm"):
             row[f] = c[f]["d_exec"] if f in c else np.nan
+            for k in ("d_avg", "d_mu"):
+                row[f"{k}_{f}"] = c[f].get(k, np.nan) if f in c else np.nan
         for k in ("Rsim_K_wm", "Rsim_K_sim", "Rsim_H_wm", "Rsim_H_sim",
                   "Rwm_K_wm", "Rwm_K_sim", "Rwm_H_wm", "Rwm_H_sim"):
             row[k] = c.get(k, np.nan)
+        row["regret_floor_K"] = c["Rsim_K_sim"] - c["Rsim_K_sim2"] if "Rsim_K_sim2" in c else np.nan
+        row["regret_bc_K"] = c["Rsim_K_sim"] - c["Rsim_K_bc"] if "Rsim_K_bc" in c else np.nan
+        for k in ("regret_J_K", "regret_J_H"):
+            row[k] = c.get(k, np.nan)
+        g = lambda k: c.get(k, np.nan)
+        for t in ("K", "H"):
+            row[f"regret_J_floor_{t}"] = g(f"Jsim_{t}_sim") - g(f"Jsim_{t}_sim2")
+            row[f"regret_J_bc_{t}"] = g(f"Jsim_{t}_sim") - g(f"Jsim_{t}_bc")
+            row[f"v_optimism_{t}"] = g(f"Vwm_{t}_wm") - g(f"Vsim_{t}_wm")
+            row[f"optimism_J_{t}"] = g(f"Jwm_{t}_wm") - g(f"Jsim_{t}_wm")
+        row["Jsim_K_sim"], row["Jsim_K_wm"] = g("Jsim_K_sim"), g("Jsim_K_wm")
         row["optimism_K"] = row["Rwm_K_wm"] - row["Rsim_K_wm"]
         row["optimism_H"] = row["Rwm_H_wm"] - row["Rsim_H_wm"]
         row["wm_pref_K"] = row["Rwm_K_wm"] - row["Rwm_K_sim"]
@@ -115,8 +149,23 @@ def summarize(rows):
                        ("floor_wm", "  floor: WM CEM vs itself"),
                        ("d_first", "first-action distance"),
                        ("w2", "W2 between final elite Gaussians"),
+                       ("d_avg", "K-step mean-action distance"),
+                       ("d_avg_floor_sim", "  floor: sim CEM vs itself"),
+                       ("d_mu", "elite-mean distance"),
+                       ("d_mu_floor_sim", "  floor: sim CEM vs itself"),
                        ("regret_K", "regret over K (true return lost)"),
+                       ("regret_floor_K", "  floor: sim CEM vs itself"),
+                       ("regret_bc_K", "  BC warm start (no search)"),
                        ("regret_H", "regret over H"),
+                       ("regret_J_H", "regret on J = R + g^H V(true), H"),
+                       ("regret_J_floor_H", "  floor: sim CEM vs itself"),
+                       ("regret_J_bc_H", "  BC warm start (no search)"),
+                       ("regret_J_K", "regret on J, K"),
+                       ("regret_J_floor_K", "  floor: sim CEM vs itself"),
+                       ("regret_J_bc_K", "  BC warm start (no search)"),
+                       ("v_optimism_H", "WM value over-estimate on a_wm, H"),
+                       ("v_optimism_K", "WM value over-estimate on a_wm, K"),
+                       ("optimism_J_H", "WM optimism on J, a_wm, H"),
                        ("optimism_K", "WM optimism on a_wm over K"),
                        ("wm_pref_K", "WM preference a_wm over a_sim, K"),
                        ("hd_wm", "Hausdorff of the a_wm rollout"),
@@ -135,14 +184,17 @@ def summarize(rows):
 
         if task not in THRESH:
             continue
+        # Main regret: on J when the run planned with the value head.
+        REG = "regret_J_H" if any(np.isfinite(r["regret_J_H"]) for r in T) else "regret_K"
+        OPT = "optimism_J_H" if REG == "regret_J_H" else "optimism_K"
         lab_rows = [r for r in T if np.isfinite(r["halluc_wm"])]
         P(f"\nBy the hallucination label of the a_wm rollout (thr {THRESH[task]} px)")
         for y in (0, 1):
             g = [r for r in lab_rows if r["halluc_wm"] == y]
             if not g:
                 continue
-            P(f"  halluc_wm={y}  n={len(g):4d}  regret_K {fmt(boot_mean(g, 'regret_K'))}  "
-              f"d_exec {boot_mean(g, 'd_exec')[0]:.3f}  optimism_K {boot_mean(g, 'optimism_K')[0]:8.3f}")
+            P(f"  halluc_wm={y}  n={len(g):4d}  {REG} {fmt(boot_mean(g, REG))}  "
+              f"d_exec {boot_mean(g, 'd_exec')[0]:.3f}  {OPT} {boot_mean(g, OPT)[0]:8.3f}")
         # Does the planner pick plans the WM hallucinates on? Same state, the
         # WM's rollout of its own plan vs of the true-model plan.
         pr = [r for r in lab_rows if np.isfinite(r["halluc_sim"])]
@@ -156,16 +208,16 @@ def summarize(rows):
 
         U = [r for r in lab_rows if "u_r" in r]
         if U:
-            keys = [k + s for k in UNC for s in ("", "_norm")] + ["motion", "d_exec", "optimism_K"]
-            big = np.nanpercentile([r["regret_K"] for r in U], 67)
-            P(f"\nAUROC on the a_wm rollout's chunk (n={len(U)}): target = halluc_wm | regret_K in top third "
+            keys = [k + s for k in UNC for s in ("", "_norm")] + ["motion", "d_exec", OPT]
+            big = np.nanpercentile([r[REG] for r in U], 67)
+            P(f"\nAUROC on the a_wm rollout's chunk (n={len(U)}): target = halluc_wm | {REG} in top third "
               f"(> {big:.2f})")
             for k in keys:
                 s = [r.get(k, np.nan) for r in U]
                 a1 = auroc(s, [r["halluc_wm"] for r in U])
-                a2 = auroc(s, [int(r["regret_K"] > big) for r in U])
+                a2 = auroc(s, [int(r[REG] > big) for r in U])
                 P(f"  {k:12s} {a1:6.3f} | {a2:6.3f}")
-            a = auroc([r["hd_wm"] for r in U], [int(r["regret_K"] > big) for r in U])
+            a = auroc([r["hd_wm"] for r in U], [int(r[REG] > big) for r in U])
             P(f"  {'hd_wm':12s}   -    | {a:6.3f}   (does the label itself flag costly decisions?)")
     return "\n".join(out)
 
