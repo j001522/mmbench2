@@ -184,7 +184,8 @@ def main():
     p.add_argument("--schedule", type=str, default="shortcut", choices=["finest", "shortcut"])
     p.add_argument("--eval_d", type=float, default=0.125)
     # RL
-    p.add_argument("--gamma", type=float, default=GAMMA)
+    p.add_argument("--gamma", type=float, default=None,
+                   help="unset = the heads checkpoint's gamma (else rl_algorithms.GAMMA)")
     p.add_argument("--lambda_", type=float, default=LAMBDA)
     p.add_argument("--alpha", type=float, default=PMPO_ALPHA)
     p.add_argument("--beta", type=float, default=PMPO_BETA)
@@ -193,6 +194,9 @@ def main():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=3e-5, help="dreamer_v4 phase 3: 3e-5")
+    p.add_argument("--warmup_steps", type=int, default=0, help="linear warmup (dreamer_v4: 100)")
+    p.add_argument("--min_lr", type=float, default=None,
+                   help="cosine decay floor over --steps (dreamer_v4: 1e-6); unset = constant lr")
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=0)
@@ -246,6 +250,18 @@ def main():
     if getattr(prior, "policy_type", "") != "gaussian":
         print(f"[warn] prior is {type(prior).__name__}; PMPO was set up for the Gaussian head")
     policy = copy.deepcopy(prior).requires_grad_(True)
+    # A value head estimates the return under the gamma it was trained with;
+    # bootstrapping it under another gamma mixes two objectives. Unset --gamma
+    # inherits the checkpoint's; an explicit mismatch is refused.
+    ckpt_gamma = heads_args.get("gamma")
+    if args.gamma is None:
+        args.gamma = float(ckpt_gamma) if ckpt_gamma is not None else GAMMA
+    if (args.value_init == "ckpt" and ckpt_gamma is not None
+            and abs(float(ckpt_gamma) - args.gamma) > 1e-9):
+        raise SystemExit(
+            f"--gamma {args.gamma} != {ckpt_gamma}, the gamma the warm-start value head in "
+            f"{args.heads_ckpt} was trained with. Match it, or use --value_init fresh.")
+    print(f"[rl] gamma={args.gamma} (heads ckpt: {ckpt_gamma}) lambda={args.lambda_}")
     if args.value_init == "ckpt":
         value = load_value_head_from_ckpt(args.heads_ckpt, device).requires_grad_(True)
     else:
@@ -338,6 +354,17 @@ def main():
                                          gamma=args.gamma, lambda_=args.lambda_)
         adv = compute_advantages(returns, values)
 
+        # Linear warmup, then cosine to min_lr (dreamer_v4 ImaginationTrainer).
+        if step < args.warmup_steps:
+            lr = args.lr * step / max(args.warmup_steps, 1)
+        elif args.min_lr is not None:
+            prog = (step - args.warmup_steps) / max(args.steps - args.warmup_steps, 1)
+            lr = max(args.min_lr, args.lr * 0.5 * (1.0 + math.cos(math.pi * prog)))
+        else:
+            lr = args.lr
+        for g in opt.param_groups:
+            g["lr"] = lr
+
         A = policy.act_dim_max
         l_v = value_loss(value, h[:, :H], returns)
         l_pi = pmpo_policy_loss(policy, prior, h[:, :H], ro["actions"], adv,
@@ -363,6 +390,7 @@ def main():
                     "value_mean": float(values.mean()),
                     "policy_std": float(policy.action_std(h[:, :H])),
                     "grad_norm": float(gnorm),
+                    "lr": lr,
                 }
             it_s = step / (time.time() - t0)
             print(f"[{step}] " + " ".join(f"{k}={v:.4g}" for k, v in s.items())
