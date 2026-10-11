@@ -7,7 +7,7 @@ lambda-returns. Fitting it on data first gives (a) a value head the CEM planner
 can use immediately as a terminal value -- replacing the latent-distance
 stand-in `plan_cem.py` flags as a substitute "for the value of the final
 imagined state (there is no value head)" -- and (b) a warm start for phase 3,
-which matters because with gamma=0.99 (effective horizon ~100 steps) and a
+which matters because with gamma=0.997 (effective horizon ~333 steps) and a
 short imagination horizon, the bootstrap carries nearly all the signal.
 
 Nothing existing is modified: the tokenizer, dynamics, reward head and BC head
@@ -149,8 +149,8 @@ def value_targets(value_head, h: torch.Tensor, rewards: torch.Tensor,
     the horizon is H = T-1 and v_{T-1} is the bootstrap.
 
     Monte-Carlo returns-to-go are NOT an option here: cup-catch episodes end by
-    500-step time limit, not termination, so the bootstrap at the episode end
-    is needed (truncation, not a terminal state), so truncation bias would contaminate every slot.
+    500-step time limit, not termination, and gamma=0.997 has a longer effective
+    horizon than the episode, so truncation bias would contaminate every slot.
     Bootstrapping is what makes the target well-posed.
     """
     T = h.shape[1]
@@ -184,10 +184,10 @@ def mc_returns_per_frame(ep: torch.Tensor, rew: torch.Tensor, gamma: float,
     obs[j-1] -> obs[j], so from frame i with episode last frame b:
         G[i] = sum_{j=i+1..b} gamma^(j-i-1) * rew[j]
 
-    Episodes end by time limit, not termination, so the truncated G undershoots
-    the infinite-horizon value the head is trained toward (the missing tail
-    weighs gamma^(b-i): at gamma=0.99, ~0.007 at the start of a 500-step episode,
-    ~0.37 at the start of a 100-step Meta-World episode). `G_tail` adds that tail assuming the reward
+    Episodes end by time limit (~500 steps), while gamma=0.997 has a longer
+    horizon than that, so the truncated G undershoots the infinite-horizon value
+    the head is trained toward (the missing tail weighs gamma^(b-i), ~0.22 at the
+    start of a 500-step episode). `G_tail` adds that tail assuming the reward
     stays at its mean over the episode's last `tail_steps` transitions:
         G_tail[i] = G[i] + gamma^(b-i) * rbar_tail / (1 - gamma)
     This is an approximation (fine for tasks that settle, e.g. reacher/cup-catch
@@ -572,7 +572,7 @@ def main():
 
     # --- loop ---------------------------------------------------------------
     # The value head needs enough passes for the window-edge bootstrap to
-    # propagate (~100/seq_len epochs at gamma=0.99); BC converges much sooner.
+    # propagate (~333/seq_len epochs at gamma=0.997); BC converges much sooner.
     # Every epoch is kept, so pick the checkpoint afterwards (closed-loop eval).
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     out_stem = os.path.splitext(args.out)[0]
