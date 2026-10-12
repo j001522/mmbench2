@@ -293,7 +293,7 @@ COMBINED_COST_KINDS = ("reward_terminal",)
 # train_heads_offline.py (--value_ckpt) and needs no goal latent.
 VALUE_COST_KINDS = ("reward_value",)
 # predictors the CEM can penalize (cem_plan --unc_kind)
-UNC_KINDS = ("u_f", "u_r", "u_f_norm", "u_r_norm")
+UNC_KINDS = ("u_f", "u_r", "u_f_norm", "u_r_norm", "u_f_res", "u_r_res")
 ALL_COST_KINDS = (LATENT_COST_KINDS + REWARD_COST_KINDS
                   + COMBINED_COST_KINDS + VALUE_COST_KINDS)
 
@@ -457,6 +457,10 @@ def cem_plan(
     log_K: int = 0,
     unc_kind: str = "u_f",
     ur_fn=None,
+    unc_mode: str = "soft",
+    unc_thr: float = 0.0,
+    unc_thr_pct: float = 0.0,
+    unc_rate: float = 0.5,
 ) -> dict:
     """Diagonal-Gaussian CEM over (horizon, act_dim) plans, clipped to [-1,1].
     `noise_beta` controls the time-axis noise color (0 = white, 2 = Brownian).
@@ -491,7 +495,23 @@ def cem_plan(
     unc_kind="u_f_norm" / "u_r_norm": the motion-normalized predictors as in
     paper_predictors.py / uncertainty.URNormScorer: per step u_t / max(m_t, 1e-3),
     m_t = RMS(z_{t+1} - z_t) of the same rollout, then averaged over the steps
-    (logged as ufn_* / urn_*)."""
+    (logged as ufn_* / urn_*).
+
+    unc_mode="hard": a discrete penalty instead of the linear one. Every
+    imagined step t is flagged when its per-step u_t (of unc_kind) exceeds tau;
+    a sample's predicted hallucination rate is the flagged fraction of its H
+    steps (averaged over its k rollouts), and
+        obj = cost + lam * 1[rate > unc_rate],   lam = c * std(cost)
+    (iteration-0 std, frozen). tau = unc_thr if > 0 (absolute, e.g. calibrated
+    on labelled rollouts), else the unc_thr_pct quantile of all per-step u of
+    the iteration-0 population (relative to this state; frozen for the call).
+    Large c makes it a filter: flagged samples only win when all are flagged."""
+    if unc_mode not in ("soft", "hard"):
+        raise ValueError(f"unc_mode={unc_mode!r} not in ('soft', 'hard')")
+    if unc_mode == "hard" and float(unc_weight) != 0.0 and not (unc_thr > 0 or 0 < unc_thr_pct < 1):
+        raise ValueError("unc_mode='hard' needs unc_thr > 0 or 0 < unc_thr_pct < 1")
+    if unc_mode == "hard" and unc_kind.endswith("_res"):
+        raise ValueError("unc_mode='hard' thresholds per-step u; *_res kinds are soft only")
     if unc_kind not in UNC_KINDS:
         raise ValueError(f"unc_kind={unc_kind!r} not in {UNC_KINDS}")
     if unc_kind.startswith("u_r") and float(unc_weight) != 0.0 and ur_fn is None:
@@ -518,13 +538,17 @@ def cem_plan(
     # per-sample uncertainty columns, each averaged over the first K / all H steps
     cols = ["uf_K", "uf_H", "motion_K", "motion_H", "ufn_K", "ufn_H"] + (
         ["ur_K", "ur_H", "urn_K", "urn_H"] if ur_fn is not None else [])
-    sel_col = {"u_f": "uf_H", "u_r": "ur_H", "u_f_norm": "ufn_H", "u_r_norm": "urn_H"}[unc_kind]
+    sel_col = {"u_f": "uf_H", "u_r": "ur_H", "u_f_norm": "ufn_H", "u_r_norm": "urn_H",
+               "u_f_res": "uf_H", "u_r_res": "ur_H"}[unc_kind]
+    c_mot = cols.index("motion_H")
+    res_ab = (float("nan"), float("nan"))    # (a, b) of the iteration-0 motion fit
     c_sel = cols.index(sel_col) if sel_col in cols else 1
     lam = 0.0
     best_obj = float("inf")
     best_where = (-1, -1)
     pop: List[dict] = []
     pop_samples: List[torch.Tensor] = []
+    tau = float(unc_thr) if float(unc_thr) > 0 else float("nan")
 
     for it in range(n_iters):
         noise = colored_noise(
@@ -555,6 +579,8 @@ def cem_plan(
         if want_unc:
             # (total, 4): u_f over first K, u_f over H, motion over K, motion over H
             unc_flat = torch.empty((total, len(cols)), device=device, dtype=torch.float32)
+            # per-step u of unc_kind, for the hard (threshold) penalty
+            u_step = torch.empty((total, horizon), device=device, dtype=torch.float32)
         for s in range(0, total, rollout_batch):
             e = min(s + rollout_batch, total)
             z0_b = z_start_b.expand(e - s, *([-1] * (z_start.dim()))).contiguous()
@@ -611,14 +637,39 @@ def cem_plan(
                     parts += [ur[:, :K_log].mean(1), ur.mean(1),
                               urn[:, :K_log].mean(1), urn.mean(1)]
                 unc_flat[s:e] = torch.stack(parts, dim=1)
+                if ur_fn is not None or not unc_kind.startswith("u_r"):
+                    u_step[s:e] = {"u_f": lambda: uf_seq, "u_f_norm": lambda: ufn,
+                                   "u_r": lambda: ur, "u_r_norm": lambda: urn,
+                                   "u_f_res": lambda: uf_seq, "u_r_res": lambda: ur}[unc_kind]().float()
 
         costs = costs_flat.view(n_samples, k_sel).mean(dim=1)
         if want_unc:
             unc_s = unc_flat.view(n_samples, k_sel, len(cols)).mean(dim=1)  # (n_samples, n_cols)
             u_sel = unc_s[:, c_sel]                                      # penalized u over H
-            if it == 0 and float(unc_weight) != 0.0:
-                lam = float(unc_weight) * float(costs.std()) / max(float(u_sel.std()), 1e-8)
-            obj = costs + lam * u_sel
+            if unc_kind.endswith("_res"):
+                # Motion-residual u: log u = a + b log m + r, fitted by least
+                # squares on the iteration-0 population (frozen, like lam); the
+                # penalty is r = how much more uncertain a sample is than a sample
+                # moving as much at this state. b=0 is raw u, b=1 is u/motion.
+                lx = unc_s[:, c_mot].clamp_min(1e-6).log()
+                ly = u_sel.clamp_min(1e-12).log()
+                if it == 0:
+                    xc = lx - lx.mean()
+                    b = float((xc * (ly - ly.mean())).sum() / xc.pow(2).sum().clamp_min(1e-12))
+                    res_ab = (float(ly.mean() - b * lx.mean()), b)
+                u_sel = ly - res_ab[0] - res_ab[1] * lx
+            if it == 0 and not math.isfinite(tau) and 0 < float(unc_thr_pct) < 1:
+                tau = float(torch.quantile(u_step.flatten(), float(unc_thr_pct)))
+            rate = ((u_step > tau).float().mean(1).view(n_samples, k_sel).mean(1)
+                    if math.isfinite(tau) else torch.full_like(costs, float("nan")))
+            if unc_mode == "hard":
+                if it == 0 and float(unc_weight) != 0.0:
+                    lam = float(unc_weight) * float(costs.std())
+                obj = costs + lam * (rate > float(unc_rate)).float()
+            else:
+                if it == 0 and float(unc_weight) != 0.0:
+                    lam = float(unc_weight) * float(costs.std()) / max(float(u_sel.std()), 1e-8)
+                obj = costs + lam * u_sel
         else:
             obj = costs
 
@@ -649,8 +700,12 @@ def cem_plan(
             is_elite = torch.zeros(n_samples, dtype=torch.bool, device=device)
             is_elite[elite_idx] = True
             r4 = lambda x: [round(float(v), 5) for v in x.tolist()]
+            # cost_rep: each of the k_sel rollouts' cost (std = return uncertainty)
             pop.append({"cost": r4(costs),
+                        "cost_rep": [r4(c) for c in costs_flat.view(n_samples, k_sel)],
                         **{c: r4(unc_s[:, j]) for j, c in enumerate(cols)},
+                        "rate": r4(rate),
+                        **({"u_res": r4(u_sel)} if unc_kind.endswith("_res") else {}),
                         "elite": is_elite.int().tolist()})
             pop_samples.append(samples.clone())
         mu, std = new_mu, new_std
@@ -663,7 +718,9 @@ def cem_plan(
     if log_pop:
         out["pop"] = {"iters": pop, "chosen_iter": best_where[0], "chosen_idx": best_where[1],
                       "unc_weight": float(unc_weight), "unc_kind": str(unc_kind),
-                      "lam": float(lam), "K": K_log}
+                      "lam": float(lam), "K": K_log,
+                      "unc_mode": str(unc_mode), "tau": float(tau), "unc_rate": float(unc_rate),
+                      "res_a": res_ab[0], "res_b": res_ab[1]}
         # The sampled plans themselves (per iteration, (n_samples, H, act_dim));
         # kept out of "pop" so it stays JSON-serializable. Used by --pop_truth.
         out["pop_samples"] = pop_samples
