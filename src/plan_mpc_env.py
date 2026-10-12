@@ -595,6 +595,8 @@ def run_episode(
                 past_actions=a_ctx, max_ctx=int(args.max_ctx), tau_ctx=float(args.tau_ctx),
                 unc_weight=float(args.unc_weight), log_pop=bool(args.log_cem_pop), log_K=K_exec,
                 unc_kind=str(args.unc_kind), ur_fn=ur_fn,
+                unc_mode=str(args.unc_mode), unc_thr=float(args.unc_thr),
+                unc_thr_pct=float(args.unc_thr_pct), unc_rate=float(args.unc_rate),
             )
 
         def sim_value_score(plans: torch.Tensor, T: int):
@@ -851,9 +853,10 @@ def run_episode(
                 # Ground truth for part of the CEM population: N samples evenly
                 # spaced in u_f rank (all iterations pooled), each replayed in the
                 # simulator (true return, frames) and in one fresh WM rollout
-                # (predicted frames -> Hausdorff, u_f, motion), exactly like the
-                # non-executed plan above. Tests whether u_f ranks plans within a
-                # state and whether every candidate hallucinates.
+                # (predicted frames -> Hausdorff; u_f, u_s over unc_seeds, u_r,
+                # motion, predicted rewards per step), like the non-executed plan
+                # above. Tests whether the predictors rank plans within a state and
+                # whether every candidate hallucinates.
                 t_pt = time.time()
                 pp = out["pop"]
                 where = [(i, j) for i, d in enumerate(pp["iters"]) for j in range(len(d["uf_H"]))]
@@ -865,13 +868,13 @@ def run_episode(
                 c16 = torch.zeros((len(pick), H_plan, 16), device=device)
                 c16[:, :, :act_dim] = cand
                 c16 = c16 * act_mask_1d.view(1, 1, 16)
-                z_c, h_c, uf_c, _ = imagine_batch(
+                z_c, h_c, uf_c, us_c = imagine_batch(
                     dyn, z_start=z_ctx.unsqueeze(0).expand(len(pick), *z_ctx.shape).contiguous(),
                     action_plan=c16, horizon=H_plan, sched=sched, k_max=k_max,
                     act_mask_1d=act_mask_1d, lang_emb=lang_emb, use_amp=use_amp, return_h=True,
                     past_actions=a_ctx.unsqueeze(0).expand(len(pick), *a_ctx.shape).contiguous(),
                     max_ctx=int(args.max_ctx), tau_ctx=float(args.tau_ctx),
-                    return_unc=True, unc_seeds=1,
+                    return_unc=True, unc_seeds=max(2, int(args.unc_seeds)),
                 )
                 r_c = predict_rewards(rew_head, h_c, use_amp=use_amp)              # (N, H)
                 mot_c = (z_c[:, 1:] - z_c[:, :-1]).float().pow(2).flatten(2).mean(2).sqrt()  # (N, H)
@@ -886,9 +889,12 @@ def run_episode(
                         "cost": float(pp["iters"][i]["cost"][j]), "uf_H_pop": float(pp["iters"][i]["uf_H"][j]),
                         "elite": int(pp["iters"][i]["elite"][j]),
                         "chosen": int((i, j) == (pp["chosen_iter"], pp["chosen_idx"])),
-                        "uf": _tolist(uf_c[n]), "motion": _tolist(mot_c[n]),
+                        "uf": _tolist(uf_c[n]), "us": _tolist(us_c[n]), "motion": _tolist(mot_c[n]),
+                        "ur": _tolist(roundtrip_residual(encoder, decoder, z_c[n, 1:],
+                                                         info=info, use_amp=use_amp)),
+                        "r_pred": _tolist(r_c[n]),
                         "Rwm_K": dsum(r_c[n].tolist(), K_exec), "Rwm_H": dsum(r_c[n].tolist(), H_plan),
-                        "Rsim_K": dsum(rw_n, K_exec), "Rsim_H": float(Rsim_H_c[n]),
+                        "Rsim_K": dsum(rw_n, K_exec), "Rsim_H": float(Rsim_H_c[n]), "r_sim": list(map(float, rw_n)),
                         "hausdorff": [mask_hausdorff(np.transpose(f, (1, 2, 0)), np.transpose(w, (1, 2, 0)),
                                                      str(args.task)) for f, w in zip(fr_n, wm_n)],
                     })
@@ -1041,7 +1047,8 @@ def run_episode(
                       f"| {cmp['pop_truth_seconds']:.1f}s", flush=True)
         if "pop" in out:
             pp = out["pop"]
-            ku = {"u_f": "uf_H", "u_r": "ur_H", "u_f_norm": "ufn_H", "u_r_norm": "urn_H"}[pp["unc_kind"]]
+            ku = {"u_f": "uf_H", "u_r": "ur_H", "u_f_norm": "ufn_H", "u_r_norm": "urn_H",
+                  "u_f_res": "uf_H", "u_r_res": "ur_H"}[pp["unc_kind"]]
             u_all = [u for d in pp["iters"] for u in d[ku]]
             u_ch = pp["iters"][pp["chosen_iter"]][ku][pp["chosen_idx"]]
             print(f"      cem_pop: lam {pp['lam']:.3g} | {pp['unc_kind']}(H) chosen {u_ch:.4f} "
@@ -1076,6 +1083,10 @@ def run_episode(
         "eval_d": float(args.eval_d),
         "unc_weight": float(args.unc_weight),
         "unc_kind": str(args.unc_kind),
+        "unc_mode": str(args.unc_mode),
+        "unc_thr": float(args.unc_thr),
+        "unc_thr_pct": float(args.unc_thr_pct),
+        "unc_rate": float(args.unc_rate),
         "env_seed": int(env_seed),
         "n_replans": len(replans),
         "pred_return_mean": _nanmean([r["pred_return"] for r in replans]),
@@ -1431,11 +1442,23 @@ def main():
                    help="WM CEM selects elites / the plan by cost + lam * u_f (u_f = flow "
                         "instability averaged over the H steps), lam = c * std(cost)/std(u_f) "
                         "of the iteration-0 population. c = this value; 0 = unchanged planner")
-    p.add_argument("--unc_kind", type=str, default="u_f", choices=["u_f", "u_r", "u_f_norm", "u_r_norm"],
+    p.add_argument("--unc_kind", type=str, default="u_f", choices=["u_f", "u_r", "u_f_norm", "u_r_norm", "u_f_res", "u_r_res"],
                    help="predictor penalized by --unc_weight. u_r = tokenizer round-trip "
                         "residual of every imagined step of every CEM sample (~+26%% planner "
                         "time); *_norm = per-step u / rollout motion, then averaged; with u_r or "
-                        "u_r_norm, --log_cem_pop logs u_f, u_r and both normalized versions")
+                        "u_r_norm, --log_cem_pop logs u_f, u_r and both normalized versions; *_res = residual of "
+                        "log u on log motion, fitted on the iteration-0 population (soft only)")
+    p.add_argument("--unc_mode", type=str, default="soft", choices=["soft", "hard"],
+                   help="soft: obj = cost + lam*u (lam = c*std(cost)/std(u)). hard: flag each "
+                        "imagined step with u_t > tau; obj = cost + c*std(cost) * 1[flagged "
+                        "fraction of the H steps > --unc_rate] (plan_cem.cem_plan)")
+    p.add_argument("--unc_thr", type=float, default=0.0,
+                   help="--unc_mode hard: absolute per-step threshold tau on u_t (> 0)")
+    p.add_argument("--unc_thr_pct", type=float, default=0.0,
+                   help="--unc_mode hard, when --unc_thr is 0: tau = this quantile of all per-step "
+                        "u of the iteration-0 population (relative to the current state)")
+    p.add_argument("--unc_rate", type=float, default=0.5,
+                   help="--unc_mode hard: penalize samples whose flagged-step fraction exceeds this")
     p.add_argument("--ur_chunk", type=int, default=256, help="latents per decode/encode call for u_r")
     p.add_argument("--log_cem_pop", action="store_true",
                    help="log every CEM sample's cost, u_f and rollout motion (first K steps and "
